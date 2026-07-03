@@ -18,16 +18,20 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 
 #include <obs-module.h>
 #include <plugin-support.h>
+#include "ai_audio_filter.h"
+#include "ai_subtitle_source.h"
 
 OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
-bool obs_module_load(void)
-{
-	obs_log(LOG_INFO, "plugin loaded successfully (version %s)", PLUGIN_VERSION);
+bool obs_module_load(void) {
+	struct obs_source_info info = get_ai_filter_info(); // Guardamos el valor en una variable
+	obs_register_source(&info);                        // Ahora sí podemos obtener su dirección
+	struct obs_source_info video_info=get_my_font_info();
+	obs_register_source(&video_info);
+
 	return true;
 }
-
 void obs_module_unload(void)
 {
 	obs_log(LOG_INFO, "plugin unloaded");
