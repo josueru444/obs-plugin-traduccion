@@ -53,9 +53,23 @@ std::string audio_processor::process_audio(const std::vector<float> &pcmf32, con
 
 	wparams.language = language.c_str(); // it will use the form option
 	wparams.translate = translate;
+
+	// posibles mejoras y soluciones para evitar alucionaciones
+	wparams.no_context = true;
+	wparams.temperature = 0.0f;
+	wparams.temperature_inc = 0.0f;
+
+	// supresores nativos
+	wparams.suppress_blank = true;
+	wparams.suppress_nst = true;
+
 	if (!initial_prompt.empty()) {
 		wparams.initial_prompt = initial_prompt.c_str();
 	}
+
+	wparams.entropy_thold = 2.60f;
+	wparams.logprob_thold = -1.00f;
+	wparams.no_speech_thold = 0.4f; // Regresado a 0.4f (es una probabilidad de 0 a 1)
 
 	// .data() obtiene el puntero crudo del vector, y .size() la cantidad de muestras
 	if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
@@ -68,7 +82,14 @@ std::string audio_processor::process_audio(const std::vector<float> &pcmf32, con
 	int n_segments = whisper_full_n_segments(ctx);
 
 	for (int i = 0; i < n_segments; i++) {
+		// --- NUEVO: Filtro basado en la probabilidad real de que sea silencio ---
+		float no_speech_prob = whisper_full_get_segment_no_speech_prob(ctx, i);
+		if (no_speech_prob > 0.4f) {
+			continue; // Ignoramos este segmento porque Whisper detectó que probablemente es ruido
+		}
+		// ------------------------------------------------------------------------
 		const char *segment_text = whisper_full_get_segment_text(ctx, i);
+
 		final_result += segment_text;
 	}
 	return final_result;
