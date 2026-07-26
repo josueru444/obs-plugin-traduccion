@@ -1,11 +1,8 @@
 #include "ai_audio_filter.h"
-#include "ai_audio_filter.h"
-#include "ai_audio_filter.h"
-#include "ai_audio_filter.h"
-#include "ai_audio_filter.h"
-
 #include "audio_processor.h"
+#include "remote_transcriber.h"
 
+#include <media-io/audio-resampler.h>
 #include <string.h>
 #include <thread>
 #include <mutex>
@@ -16,17 +13,27 @@
 #include <cmath>
 #include <algorithm>
 #include <cctype>
+#include <unordered_set>
+#include <unordered_map>
 
-static const float SILENCE_RMS_THRESHOLD = 0.0015f;
-static const size_t MIN_SPEECH_MS = 300;
+// ─────────────────────────────────────────────────────────────────────────────
+// VAD constants
+// ─────────────────────────────────────────────────────────────────────────────
+static const float SILENCE_RMS_THRESHOLD = 0.003f;
+static const size_t MIN_SPEECH_MS = 500;
 static const size_t SILENCE_HANGOVER_MS = 600;
 static const size_t MAX_SEGMENT_MS = 15000;
 static const size_t PREROLL_MS = 200;
+static const size_t OVERLAP_MS = 200;
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Data structures
+// ─────────────────────────────────────────────────────────────────────────────
 struct VadState {
 	bool speaking = false;
 	std::vector<float> speech_frames;
 	std::vector<float> preroll;
+	std::vector<float> overlap_buffer;
 	size_t silence_ms = 0;
 	size_t speech_ms = 0;
 	size_t last_partial_ms = 0;
@@ -40,45 +47,113 @@ struct AudioSegment {
 };
 
 struct ai_filter_data {
-	audio_processor *processor;
+	// ── Transcription backend (only one active at a time) ─────────────────────
+	audio_processor *processor;       // Local mode: Whisper (nullptr in remote mode)
+	RemoteTranscriber *remote_client; // Remote mode: WebSocket (nullptr in local mode)
+
+	// ── Configuration ─────────────────────────────────────────────────────────
+	bool use_remote_transcription; // true = send audio to WebSocket server
+	std::string ws_url;            // WebSocket server base URL
+	std::string ws_token;          // WebSocket authentication token (optional)
+	std::string connection_status{"🔴 Desconectado"};
+	std::mutex status_mutex;
+	obs_source_t *self_source{nullptr};
+	std::string current_language;
+	std::string target_language;
+	bool local_translation;
+	bool use_gpu;
+	int whisper_threads;
+	std::string current_model_path;
+	std::string target_source_name;
+
+	// ── VAD and audio pipeline ────────────────────────────────────────────────
 	VadState vad;
 	std::queue<AudioSegment> segment_queue;
 	std::mutex queue_mutex;
 	std::condition_variable cv;
 	std::thread worker_thread;
 	std::atomic<bool> stop_worker;
-	std::string current_language;
-	bool local_translation;
-	bool use_gpu;
-	std::string current_model_path;
 
-	// store translation text
-	std::string target_source_name;
-	// VAD
+	audio_resampler_t *resampler;
+	uint32_t resampler_src_rate;
+
 	struct whisper_vad_context *vad_ctx;
 };
 
-// limit text historythe last N characters and let OBS handle the word wrap
+// Build full WebSocket URL with token parameter if present
+static std::string build_full_ws_url(const std::string &url, const std::string &token, const std::string &lang_in, const std::string &lang_out)
+{
+	if (url.empty()) return url;
+	std::string full_url = url;
+	bool has_query = (full_url.find('?') != std::string::npos);
+
+	auto append_param = [&](const std::string &key, const std::string &val) {
+		if (val.empty()) return;
+		if (has_query) full_url += "&" + key + "=" + val;
+		else { full_url += "?" + key + "=" + val; has_query = true; }
+	};
+
+	append_param("token", token);
+	append_param("lang_in", lang_in);
+	append_param("lang_out", lang_out);
+
+	return full_url;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Text helper functions
+// ─────────────────────────────────────────────────────────────────────────────
 static std::string format_subtitles(const std::string &text, size_t max_chars = 150)
 {
 	if (text.length() <= max_chars)
 		return text;
 
-	// avoid cutting a word in half, find the first space AFTER our cut point
 	size_t start_pos = text.length() - max_chars;
 	size_t space_pos = text.find_first_of(" \t\n", start_pos);
 
-	if (space_pos != std::string::npos && space_pos < text.length() - 1) {
+	if (space_pos != std::string::npos && space_pos < text.length() - 1)
 		return text.substr(space_pos + 1);
-	}
 
 	return text.substr(start_pos);
 }
 
-// remove tags like [Music] or (silence)
+static bool is_repetitive(const std::string &text)
+{
+	std::vector<std::string> words;
+	std::string current;
+	for (char c : text) {
+		if (std::isalnum(static_cast<unsigned char>(c))) {
+			current += std::tolower(static_cast<unsigned char>(c));
+		} else if (!current.empty()) {
+			words.push_back(current);
+			current.clear();
+		}
+	}
+	if (!current.empty())
+		words.push_back(current);
+
+	if (words.size() < 4)
+		return false;
+
+	std::unordered_map<std::string, int> bigram_counts;
+	for (size_t i = 0; i + 1 < words.size(); ++i) {
+		std::string bigram = words[i] + " " + words[i + 1];
+		bigram_counts[bigram]++;
+		if (bigram_counts[bigram] >= 3)
+			return true;
+	}
+
+	std::unordered_set<std::string> unique_words(words.begin(), words.end());
+	float unique_ratio = (float)unique_words.size() / (float)words.size();
+	if (unique_ratio < 0.35f)
+		return true;
+
+	return false;
+}
+
 static std::string sanitize_text(const std::string &text)
 {
-	std::string result = "";
+	std::string result;
 	bool in_bracket = false;
 	bool in_paren = false;
 	bool in_asterisk = false;
@@ -99,53 +174,89 @@ static std::string sanitize_text(const std::string &text)
 			continue;
 		}
 
-		if (!in_bracket && !in_paren && !in_asterisk) {
+		if (!in_bracket && !in_paren && !in_asterisk)
 			result += c;
-		}
 	}
 
-	//  Trim whitespace
 	size_t start = result.find_first_not_of(" \t\n\r");
 	if (start == std::string::npos)
 		return "";
 	size_t end = result.find_last_not_of(" \t\n\r");
 	result = result.substr(start, end - start + 1);
 
-	// Filtro adicional para alucinaciones comunes de Whisper
-	std::string clean = "";
-	for (char c : result) {
-		if (std::isalpha(c) || c == ' ') clean += std::tolower(c);
-	}
-	if (clean == "the end" || clean == "subscribe" || clean == "sign up at domestikaorg" || 
-	    clean == "im sorry im sorry" || clean == "im not sure what im doing here" || 
-	    clean == "gracias" || clean == "thank you" || clean == "thanks for watching") {
+	if (result.length() <= 2)
 		return "";
-	}
+	if (is_repetitive(result))
+		return "";
 
 	return result;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// update_subtitle_source
+//
+// Shared function between local mode (Whisper) and remote mode (WebSocket).
+// In remote mode, invoke from RemoteTranscriber callback (io_context thread).
+// Do not block this execution path.
+// ─────────────────────────────────────────────────────────────────────────────
+static void update_subtitle_source(ai_filter_data *data, const std::string &text, bool is_final)
+{
+	obs_source_t *custom_source = nullptr;
+	obs_enum_sources(
+		[](void *param, obs_source_t *source) {
+			obs_source_t **found = (obs_source_t **)param;
+			if (strcmp(obs_source_get_unversioned_id(source), "fuente_subtitulos_ia") == 0) {
+				*found = obs_source_get_ref(source);
+				return false;
+			}
+			return true;
+		},
+		&custom_source);
+
+	if (custom_source != nullptr) {
+		std::string texto_final = is_final ? text : text + "...";
+		std::string texto_fmt = format_subtitles(texto_final, 150);
+
+		obs_data_t *new_settings = obs_data_create();
+		obs_data_set_string(new_settings, "text", texto_fmt.c_str());
+		obs_source_update(custom_source, new_settings);
+		obs_data_release(new_settings);
+		obs_source_release(custom_source);
+	}
+
+	(void)data; // reserve for future multi-source support
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// transcription_worker
+//
+// Dedicated worker thread separate from OBS audio thread.
+// Read audio segments from queue and dispatch to active backend:
+//   - Local mode  -> call Whisper and update subtitle directly.
+//   - Remote mode -> encode to Opus, send via WebSocket, and return.
+//                    Response arrives asynchronously in on_message().
+// ─────────────────────────────────────────────────────────────────────────────
 static void transcription_worker(ai_filter_data *data)
 {
 	while (!data->stop_worker.load()) {
 		AudioSegment segment;
 		{
 			std::unique_lock<std::mutex> lock(data->queue_mutex);
-			data->cv.wait(lock,
-				      [data] { return !data->segment_queue.empty() || data->stop_worker.load(); });
+			data->cv.wait(lock, [data] {
+				return !data->segment_queue.empty() || data->stop_worker.load();
+			});
 
-			if (data->stop_worker.load() && data->segment_queue.empty()) {
+			if (data->stop_worker.load() && data->segment_queue.empty())
 				break;
-			}
 
 			segment = data->segment_queue.front();
 			data->segment_queue.pop();
 
+			// Discard obsolete partial segments for same sentence_id
 			while (!segment.is_final && !data->segment_queue.empty()) {
-				AudioSegment next_seg = data->segment_queue.front();
-
-				if (!next_seg.is_final && next_seg.sentence_id == segment.sentence_id) {
-					segment = next_seg;
+				AudioSegment &next = data->segment_queue.front();
+				if (!next.is_final && next.sentence_id == segment.sentence_id) {
+					segment = next;
 					data->segment_queue.pop();
 				} else {
 					break;
@@ -153,276 +264,432 @@ static void transcription_worker(ai_filter_data *data)
 			}
 		}
 
-		if (!segment.audio.empty()) {
-			std::string prompt = segment.is_final ? "Vocabulario coloquial mexicano: wey, no mames, pinche, cabrón, pendejo." : "";
-			std::string raw_texto = data->processor->process_audio(segment.audio, data->current_language,
-									       data->local_translation, prompt);
+		if (segment.audio.empty())
+			continue;
+
+		if (data->use_remote_transcription && data->remote_client) {
+			// ── Remote mode ───────────────────────────────────────────────────
+			// Send audio only. Response arrives async via RemoteTranscriber callback,
+			// which calls update_subtitle_source().
+			data->remote_client->send_audio(segment.audio, segment.sentence_id,
+			                                segment.is_final);
+
+		} else if (data->processor) {
+			// ── Local mode (Whisper) ──────────────────────────────────────────
+			std::string raw_texto = data->processor->process_audio(
+				segment.audio, data->current_language, data->local_translation, "",
+				data->whisper_threads);
 			std::string texto = sanitize_text(raw_texto);
+
 			if (!texto.empty()) {
-				blog(LOG_INFO, "[Traductor IA] Transcripción (%s): %s",
-				     segment.is_final ? "FINAL" : "PARCIAL", texto.c_str());
-
-				// automatically search for the "fuente_subtitulos_ia" source
-				obs_source_t *custom_source = nullptr;
-				obs_enum_sources(
-					[](void *data, obs_source_t *source) {
-						obs_source_t **found = (obs_source_t **)data;
-						if (strcmp(obs_source_get_unversioned_id(source),
-							   "fuente_subtitulos_ia") == 0) {
-							*found = obs_source_get_ref(source);
-							return false; // stop search after finding the source
-						}
-						return true; // continue searching
-					},
-					&custom_source);
-
-				if (custom_source != nullptr) {
-					obs_data_t *new_settings = obs_data_create();
-
-					// add 3 dots if partial
-					std::string texto_final = segment.is_final ? texto : texto + "...";
-
-					// limit history~150 characterslet OBS do Word Wrap
-					std::string texto_formateado = format_subtitles(texto_final, 150);
-
-					obs_data_set_string(new_settings, "text", texto_formateado.c_str());
-					obs_source_update(custom_source, new_settings);
-					obs_data_release(new_settings);
-					obs_source_release(custom_source);
-				}
+				blog(LOG_INFO, "[AI Translator] Local transcription (%s): %s",
+				     segment.is_final ? "FINAL" : "PARTIAL", texto.c_str());
+				update_subtitle_source(data, texto, segment.is_final);
 			}
 		}
 	}
 }
 
-// search automatically, the search_ai_subtitle_source function is no longer needed
+// ─────────────────────────────────────────────────────────────────────────────
+// Property callbacks
+// ─────────────────────────────────────────────────────────────────────────────
 
-static bool btn_save(obs_properties_t *props, obs_property_t *property, void *data)
+// Refresh connection status manually from the UI
+static bool on_refresh_status_clicked(obs_properties_t *props, obs_property_t *p, void *data)
 {
-	(void)props;
-	(void)property;
-	(void)data;
+	(void)p;
+	ai_filter_data *fd = static_cast<ai_filter_data *>(data);
+	std::string status_msg = "⚪ Inactivo (Modo local activo)";
+
+	if (fd && fd->use_remote_transcription) {
+		std::lock_guard<std::mutex> lock(fd->status_mutex);
+		status_msg = fd->connection_status;
+	}
+
+	obs_property_t *status_prop = obs_properties_get(props, "status_label");
+	if (status_prop) {
+		obs_property_set_description(status_prop, ("Estado: " + status_msg).c_str());
+	}
+
+	return true; // Force UI refresh
+}
+
+// Hide Whisper property group when remote transcription is enabled.
+static bool on_remote_transcription_toggled(obs_properties_t *props, obs_property_t *p,
+                                             obs_data_t *settings)
+{
+	(void)p;
+	bool use_remote = obs_data_get_bool(settings, "use_remote_transcription");
+	obs_property_t *model_group = obs_properties_get(props, "grp_models");
+	if (model_group)
+		obs_property_set_visible(model_group, !use_remote);
 	return true;
 }
 
-static bool on_external_server_toggled(obs_properties_t *props, obs_property_t *p, obs_data_t *settings)
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter defaults
+// ─────────────────────────────────────────────────────────────────────────────
+static void ai_filter_get_defaults(obs_data_t *settings)
 {
-	(void)p;
-	// read if external server group is enabled
-	bool use_external = obs_data_get_bool(settings, "use_external_server");
-
-	// find the checkbox and help text for local translation
-	obs_property_t *local_trans = obs_properties_get(props, "local_translation");
-	obs_property_t *trans_help = obs_properties_get(props, "trans_help");
-
-	// hide local translation if external server is used
-	if (local_trans)
-		obs_property_set_visible(local_trans, !use_external);
-	if (trans_help)
-		obs_property_set_visible(trans_help, !use_external);
-
-	return true; // force OBSredraw the window
+	obs_data_set_default_string(settings, "model_settings", "ggml-base.bin");
+	obs_data_set_default_int(settings, "whisper_threads", 4);
+	obs_data_set_default_string(settings, "lang_in", "auto");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter properties (UI)
+// ─────────────────────────────────────────────────────────────────────────────
 obs_properties_t *ai_filter_get_properties(void *data)
 {
 	(void)data;
 	obs_properties_t *props = obs_properties_create();
 
-	//  --- SECTION 1: AI ENGINE ---
+	// ── Group 1: Local Transcription Engine (Whisper) ─────────────────────────
 	obs_properties_t *group_model = obs_properties_create();
 
-	obs_property_t *combo_model = obs_properties_add_list(
-		group_model, "model_settings", "Modelo predeterminado:", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_t *combo_model =
+		obs_properties_add_list(group_model, "model_settings", "Modelo predeterminado:",
+		                        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(combo_model, "Tiny (Rápido)", "ggml-tiny.bin");
 	obs_property_list_add_string(combo_model, "Base (Balanceado)", "ggml-base.bin");
 	obs_property_list_add_string(combo_model, "Small (Alta Precisión)", "ggml-small.bin");
-	obs_properties_add_text(group_model, "model_help",
-				"Modelos más grandes (Small) ofrecen mayor precisión pero consumen más recursos.",
-				OBS_TEXT_INFO);
+	obs_properties_add_text(
+		group_model, "model_help",
+		"Modelos más grandes (Small) ofrecen mayor precisión pero consumen más recursos.",
+		OBS_TEXT_INFO);
 
 	obs_properties_add_bool(group_model, "use_custom_model", "Usar modelo personalizado");
-	obs_properties_add_path(group_model, "custom_model_path", "O usa un modelo local (.bin):", OBS_PATH_FILE,
-				"Modelos Whisper (*.bin);;Todos los archivos (*.*)", NULL);
+	obs_properties_add_path(group_model, "custom_model_path", "O usa un modelo local (.bin):",
+	                        OBS_PATH_FILE,
+	                        "Modelos Whisper (*.bin);;Todos los archivos (*.*)", NULL);
+
+	obs_properties_add_int(group_model, "whisper_threads", "Hilos de CPU:", 1, 8, 1);
 
 	obs_properties_add_bool(group_model, "processing_mode", "Usar Tarjeta de Video (GPU)");
-	obs_properties_add_text(group_model, "gpu_help",
-				"Nota: Si falla la transcripción, desmarca esta casilla para usar tu procesador.",
-				OBS_TEXT_INFO);
+	obs_properties_add_text(
+		group_model, "gpu_help",
+		"Nota: Si falla la transcripción, desmarca esta casilla para usar tu procesador.",
+		OBS_TEXT_INFO);
 
-	obs_properties_add_group(props, "grp_models", "1. Motor de Transcripción (Whisper)", OBS_GROUP_NORMAL,
-				 group_model);
+	obs_properties_add_group(props, "grp_models", "1. Motor de Transcripción Local (Whisper)",
+	                          OBS_GROUP_NORMAL, group_model);
 
-	//  --- SECTION 2: LANGUAGES AND QUICK TRANSLATION ---
+	// ── Group 2: Input Language ───────────────────────────────────────────────
 	obs_properties_t *group_translation = obs_properties_create();
 
-	obs_property_t *combo_in = obs_properties_add_list(
-		group_translation, "lang_in", "Idioma que vas a hablar:", OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_t *combo_in =
+		obs_properties_add_list(group_translation, "lang_in", "Idioma que vas a hablar:",
+		                        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
 	obs_property_list_add_string(combo_in, "Automático", "auto");
 	obs_property_list_add_string(combo_in, "Español", "es");
 	obs_property_list_add_string(combo_in, "Inglés", "en");
 
-	obs_properties_add_bool(group_translation, "local_translation", "Traducir al Inglés (Modelo Local)");
-	obs_properties_add_text(group_translation, "trans_help",
-				"Nota: El modelo local solo soporta traducción hacia el Inglés.", OBS_TEXT_INFO);
-
-	obs_properties_add_group(props, "grp_translation", "2. Idioma de Entrada", OBS_GROUP_NORMAL, group_translation);
-
-	//  --- SECTION 3: EXTERNAL SERVER (LM Studio) ---
-	obs_properties_t *group_connection = obs_properties_create();
-	obs_properties_add_text(group_connection, "server_url", "URL de LM Studio:", OBS_TEXT_DEFAULT);
-	obs_properties_add_int(group_connection, "server_port", "Puerto:", 1, 65535, 1);
-
-	obs_property_t *combo_out = obs_properties_add_list(group_connection, "lang_out",
-							    "Traducir hacia (Idioma de salida):", OBS_COMBO_TYPE_LIST,
-							    OBS_COMBO_FORMAT_STRING);
-	obs_property_list_add_string(combo_out, "Español", "es");
+	obs_property_t *combo_out =
+		obs_properties_add_list(group_translation, "lang_out", "Idioma de Traducción (Salida):",
+		                        OBS_COMBO_TYPE_LIST, OBS_COMBO_FORMAT_STRING);
+	obs_property_list_add_string(combo_out, "Mismo que el original", "original");
 	obs_property_list_add_string(combo_out, "Inglés", "en");
+	obs_property_list_add_string(combo_out, "Español", "es");
 
-	// act as a Checkbox that turns it on/off since it is OBS_GROUP_CHECKABLE
-	obs_property_t *ext_group = obs_properties_add_group(props, "use_external_server",
-							     "3. Usar Servidor Externo (Traducciones Complejas)",
-							     OBS_GROUP_CHECKABLE, group_connection);
-	obs_property_set_modified_callback(ext_group, on_external_server_toggled);
+	obs_properties_add_text(
+		group_translation, "trans_help",
+		"Nota: El motor local (Whisper) solo soporta traducir hacia el Inglés. El servidor remoto soporta todos.", OBS_TEXT_INFO);
 
-	//  --- FINAL BUTTON ---
-	obs_properties_add_button(props, "btn_save", "Aplicar Cambios", btn_save);
+	obs_properties_add_group(props, "grp_translation", "2. Idioma de Entrada / Salida", OBS_GROUP_NORMAL,
+	                         group_translation);
+
+	// ── Group 3: Remote Transcription via WebSocket ───────────────────────────
+	obs_properties_t *group_remote = obs_properties_create();
+
+	obs_properties_add_text(group_remote, "ws_url", "URL del servidor WebSocket:",
+	                        OBS_TEXT_DEFAULT);
+	obs_properties_add_text(group_remote, "ws_token", "Token de Autenticación (Opcional):",
+	                        OBS_TEXT_DEFAULT);
+
+	std::string status_msg = "🔴 Desconectado";
+	if (data) {
+		ai_filter_data *fd = static_cast<ai_filter_data *>(data);
+		if (fd->use_remote_transcription) {
+			std::lock_guard<std::mutex> lock(fd->status_mutex);
+			status_msg = fd->connection_status;
+		} else {
+			status_msg = "⚪ Inactivo (Modo local activo)";
+		}
+	}
+	obs_properties_add_text(group_remote, "status_label", ("Estado: " + status_msg).c_str(),
+	                        OBS_TEXT_INFO);
+	obs_properties_add_button(group_remote, "refresh_status_btn", "↻ Actualizar Estado",
+	                          on_refresh_status_clicked);
+
+	obs_properties_add_text(
+		group_remote, "remote_info",
+		"El servidor debe responder con JSON:\n"
+		"{\"text\": \"...\", \"sentence_id\": N, \"is_final\": true}\n"
+		"El audio se envía codificado en Opus (16kHz, mono, 24kbps).",
+		OBS_TEXT_INFO);
+
+	obs_property_t *remote_group = obs_properties_add_group(
+		props, "use_remote_transcription", "3. Traducción Remota (WebSocket)",
+		OBS_GROUP_CHECKABLE, group_remote);
+	obs_property_set_modified_callback(remote_group, on_remote_transcription_toggled);
 
 	return props;
 }
 
-// return the filter name
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter name
+// ─────────────────────────────────────────────────────────────────────────────
 static const char *ai_filter_get_name(void *data)
 {
 	(void)data;
 	return "Traductor IA";
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ai_filter_update — Apply new configuration
+//
+// If mode or URL changes:
+//   1. Stop worker thread
+//   2. Destroy previous backend
+//   3. Create new backend (Whisper or RemoteTranscriber)
+//   4. Restart worker thread
+// ─────────────────────────────────────────────────────────────────────────────
 static void ai_filter_update(void *data, obs_data_t *settings)
 {
-	// unpack our filter memory
-	ai_filter_data *filter_data = static_cast<ai_filter_data *>(data);
+	ai_filter_data *fd = static_cast<ai_filter_data *>(data);
 
-	// save all UI values in our filter
-	filter_data->current_language = obs_data_get_string(settings, "lang_in");
-	filter_data->use_gpu = obs_data_get_bool(settings, "processing_mode");
+	std::string old_lang_in = fd->current_language;
+	std::string old_lang_out = fd->target_language;
 
-	// transcribe with local model
-	filter_data->local_translation = obs_data_get_bool(settings, "local_translation");
+	// Update basic settings (no backend restart required)
+	fd->current_language = obs_data_get_string(settings, "lang_in");
+	fd->target_language = obs_data_get_string(settings, "lang_out");
+	fd->local_translation = (fd->target_language == "en");
+	fd->use_gpu = obs_data_get_bool(settings, "processing_mode");
+	fd->whisper_threads = (int)obs_data_get_int(settings, "whisper_threads");
 
-	// save the previous pathcheck if it changed
-	std::string old_path = filter_data->current_model_path;
-
-	// choose between Combo Box or Custom Path
+	// Determine Whisper model path
+	std::string old_path = fd->current_model_path;
+	std::string new_path;
 	bool use_custom = obs_data_get_bool(settings, "use_custom_model");
 	const char *custom_path = obs_data_get_string(settings, "custom_model_path");
 
 	if (use_custom && custom_path && custom_path[0] != '\0') {
-		// use manual path if provided
-		filter_data->current_model_path = custom_path;
+		new_path = custom_path;
 	} else {
-		// search the packed model from the combo box if no manual path
 		const char *model_size = obs_data_get_string(settings, "model_settings");
-		char relative_path[256];
-		snprintf(relative_path, sizeof(relative_path), "models/%s", model_size);
-
-		char *absolute_model_path = obs_module_file(relative_path);
-		if (absolute_model_path) {
-			filter_data->current_model_path = absolute_model_path;
-			bfree(absolute_model_path);
+		char rel[256];
+		snprintf(rel, sizeof(rel), "models/%s", model_size);
+		char *abs_path = obs_module_file(rel);
+		if (abs_path) {
+			new_path = abs_path;
+			bfree(abs_path);
 		} else {
-			blog(LOG_ERROR, "Error: No se encontro el modelo %s en la carpeta data", relative_path);
+			blog(LOG_ERROR, "[AI Translator] Model file not found: %s", rel);
 		}
 	}
-	blog(LOG_INFO, "[Traductor IA] Ruta del modelo a usar: %s", filter_data->current_model_path.c_str());
 
-	// hot-swap the processor if the path changed and the processor exists
-	if (filter_data->processor != nullptr && old_path != filter_data->current_model_path) {
-		blog(LOG_INFO, "[Traductor IA] Detectado cambio de modelo. Reiniciando motor IA...");
+	// Read remote mode settings
+	std::string old_full_url = build_full_ws_url(fd->ws_url, fd->ws_token, old_lang_in, old_lang_out);
+	bool old_use_remote = fd->use_remote_transcription;
 
-		// stop the current thread safely
-		filter_data->stop_worker.store(true);
-		filter_data->cv.notify_all();
-		if (filter_data->worker_thread.joinable()) {
-			filter_data->worker_thread.join();
+	bool new_use_remote = obs_data_get_bool(settings, "use_remote_transcription");
+	std::string new_ws_url = obs_data_get_string(settings, "ws_url");
+	std::string new_ws_token = obs_data_get_string(settings, "ws_token");
+
+	std::string new_full_url = build_full_ws_url(new_ws_url, new_ws_token, fd->current_language, fd->target_language);
+
+	// Save updated values in data struct
+	fd->current_model_path = new_path;
+	fd->use_remote_transcription = new_use_remote;
+	fd->ws_url = new_ws_url;
+	fd->ws_token = new_ws_token;
+
+	// ── Detect backend restart requirement ───────────────────────────────────
+	bool has_backend = (fd->processor != nullptr || fd->remote_client != nullptr);
+	bool mode_changed = has_backend && (new_use_remote != old_use_remote);
+	bool path_changed = has_backend && !new_use_remote && (new_path != old_path);
+
+	// If remote mode is active and only URL/Token changed, update URL in-place without destroying thread
+	if (has_backend && !mode_changed && new_use_remote && fd->remote_client) {
+		if (new_full_url != old_full_url) {
+			fd->remote_client->update_url(new_full_url);
 		}
-
-		// destroy the old processor and free memory
-		delete filter_data->processor;
-
-		// create a new processor with the new path
-		filter_data->processor = new audio_processor(filter_data->current_model_path);
-
-		// restart the worker thread
-		filter_data->stop_worker.store(false);
-		filter_data->worker_thread = std::thread(transcription_worker, filter_data);
-
-		blog(LOG_INFO, "[Traductor IA] Nuevo modelo cargado en caliente y listo.");
+		return;
 	}
+
+	if (!has_backend || (!mode_changed && !path_changed))
+		return; // First call or no structural backend change
+
+	blog(LOG_INFO, "[AI Translator] Reconfigure backend (mode=%s, path=%s)",
+	     mode_changed ? "changed" : "-", path_changed ? "changed" : "-");
+
+	// ── 1. Stop worker thread ────────────────────────────────────────────────
+	fd->stop_worker.store(true);
+	fd->cv.notify_all();
+	if (fd->worker_thread.joinable())
+		fd->worker_thread.join();
+
+	// ── 2. Destroy previous backend ──────────────────────────────────────────
+	if (fd->remote_client) {
+		delete fd->remote_client;
+		fd->remote_client = nullptr;
+	}
+	if (fd->processor) {
+		delete fd->processor;
+		fd->processor = nullptr;
+	}
+
+	// ── 3. Create new backend ────────────────────────────────────────────────
+	if (new_use_remote) {
+		blog(LOG_INFO, "[AI Translator] Start remote mode -> %s", new_full_url.c_str());
+		auto result_cb = [fd](const TranscriptionResult &r) {
+			std::string texto = sanitize_text(r.text);
+			if (!texto.empty()) {
+				blog(LOG_INFO, "[AI Translator] <- Remote (%s): %s",
+				     r.is_final ? "FINAL" : "PARTIAL", texto.c_str());
+				update_subtitle_source(fd, texto, r.is_final);
+			}
+		};
+		auto status_cb = [fd](const std::string &status_text) {
+			std::lock_guard<std::mutex> lock(fd->status_mutex);
+			fd->connection_status = status_text;
+		};
+		fd->remote_client = new RemoteTranscriber(new_full_url, result_cb, status_cb);
+	} else {
+		blog(LOG_INFO, "[AI Translator] Start local mode (Whisper)");
+		fd->processor = new audio_processor(fd->current_model_path);
+	}
+
+	// ── 4. Restart worker thread ─────────────────────────────────────────────
+	fd->stop_worker.store(false);
+	fd->worker_thread = std::thread(transcription_worker, fd);
 }
 
-// provide the required definition
+// ─────────────────────────────────────────────────────────────────────────────
+// ai_filter_create
+// ─────────────────────────────────────────────────────────────────────────────
 static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 {
 	(void)source;
 	ai_filter_data *data = new ai_filter_data();
+	data->resampler = nullptr;
+	data->resampler_src_rate = 0;
 	data->stop_worker.store(false);
+	data->processor = nullptr;
+	data->remote_client = nullptr;
+	data->use_remote_transcription = false;
+	data->ws_url = "";
+	data->ws_token = "";
+
+	// Read initial settings into data struct
 	ai_filter_update(data, settings);
 
-	data->processor = new audio_processor(data->current_model_path);
+	// Create appropriate backend based on initial configuration
+	std::string full_url = build_full_ws_url(data->ws_url, data->ws_token, data->current_language, data->target_language);
+	if (data->use_remote_transcription && !full_url.empty()) {
+		blog(LOG_INFO, "[AI Translator] Create with remote mode -> %s", full_url.c_str());
+		auto result_cb = [data](const TranscriptionResult &r) {
+			std::string texto = sanitize_text(r.text);
+			if (!texto.empty()) {
+				blog(LOG_INFO, "[AI Translator] <- Remote (%s): %s",
+				     r.is_final ? "FINAL" : "PARTIAL", texto.c_str());
+				update_subtitle_source(data, texto, r.is_final);
+			}
+		};
+		auto status_cb = [data](const std::string &status_text) {
+			std::lock_guard<std::mutex> lock(data->status_mutex);
+			data->connection_status = status_text;
+		};
+		data->remote_client = new RemoteTranscriber(full_url, result_cb, status_cb);
+	} else {
+		blog(LOG_INFO, "[AI Translator] Create with local mode (Whisper)");
+		data->processor = new audio_processor(data->current_model_path);
+	}
 
+	// Start worker thread
 	data->worker_thread = std::thread(transcription_worker, data);
 
-	// load VAD model
+	// Initialize Silero VAD
 	struct whisper_vad_context_params vad_params = whisper_vad_default_context_params();
 	char *vad_model_path = obs_module_file("models/silero_vad.bin");
 	if (vad_model_path) {
 		data->vad_ctx = whisper_vad_init_from_file_with_params(vad_model_path, vad_params);
 		bfree(vad_model_path);
-		blog(LOG_INFO, "[Traductor IA] VAD de Silero inicializado correctamente.");
 	} else {
-		blog(LOG_ERROR, "[Traductor IA] Error: No se encontró el modelo VAD silero_vad.bin en models/");
 		data->vad_ctx = nullptr;
 	}
 
 	return data;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ai_filter_destroy
+//
+// Cleanup sequence (CRITICAL to avoid use-after-free):
+//   1. Stop worker thread
+//   2. Destroy remote_client (waits for network thread termination)
+//   3. Destroy processor
+//   4. Free VAD and resampler
+//   5. Delete main data structure
+// ─────────────────────────────────────────────────────────────────────────────
 static void ai_filter_destroy(void *data)
 {
-	ai_filter_data *filter_data = static_cast<ai_filter_data *>(data);
+	ai_filter_data *fd = static_cast<ai_filter_data *>(data);
 
-	filter_data->stop_worker.store(true);
-	filter_data->cv.notify_all();
-	if (filter_data->worker_thread.joinable()) {
-		filter_data->worker_thread.join();
+	// 1. Stop worker thread
+	fd->stop_worker.store(true);
+	fd->cv.notify_all();
+	if (fd->worker_thread.joinable())
+		fd->worker_thread.join();
+
+	// 2. Destroy RemoteTranscriber (destructor waits for network thread)
+	//    MUST happen before freeing fd to prevent callbacks to dangling memory.
+	if (fd->remote_client) {
+		delete fd->remote_client;
+		fd->remote_client = nullptr;
 	}
 
-	if (filter_data->processor) {
-		delete filter_data->processor;
-	}
-	// destroying vad
-	if (filter_data->vad_ctx) {
-		whisper_vad_free(filter_data->vad_ctx);
+	// 3. Destroy Whisper processor
+	if (fd->processor) {
+		delete fd->processor;
+		fd->processor = nullptr;
 	}
 
-	delete filter_data;
+	// 4. Free VAD context and resampler
+	if (fd->vad_ctx)
+		whisper_vad_free(fd->vad_ctx);
+	if (fd->resampler) {
+		audio_resampler_destroy(fd->resampler);
+		fd->resampler = nullptr;
+	}
+
+	// 5. Delete main data structure
+	delete fd;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Default settings
+// ─────────────────────────────────────────────────────────────────────────────
 static void aI_filter_get_default(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "lang_in", "es");
 	obs_data_set_default_string(settings, "lang_out", "en");
-
 	obs_data_set_default_string(settings, "model_settings", "ggml-base.bin");
-	obs_data_set_default_string(settings, "custom_model_path", ""); // set empty path by default
+	obs_data_set_default_string(settings, "custom_model_path", "");
+	obs_data_set_default_int(settings, "whisper_threads", 4);
 	obs_data_set_default_bool(settings, "use_custom_model", false);
 	obs_data_set_default_bool(settings, "processing_mode", false);
-
-	// set default local translation
 	obs_data_set_default_bool(settings, "local_translation", false);
+	// Remote mode defaults
+	obs_data_set_default_bool(settings, "use_remote_transcription", false);
+	obs_data_set_default_string(settings, "ws_url", "");
+	obs_data_set_default_string(settings, "ws_token", "");
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// _flush_segment — Finalize active speech segment and enqueue
+// ─────────────────────────────────────────────────────────────────────────────
 static void _flush_segment(ai_filter_data *filter_data)
 {
 	if (filter_data->vad.speech_ms >= MIN_SPEECH_MS) {
@@ -438,36 +705,79 @@ static void _flush_segment(ai_filter_data *filter_data)
 		filter_data->cv.notify_one();
 
 		filter_data->vad.sentence_id++;
+
+		size_t overlap_samples = OVERLAP_MS * 16;
+		if (filter_data->vad.speech_frames.size() > overlap_samples) {
+			filter_data->vad.overlap_buffer.assign(
+				filter_data->vad.speech_frames.end() - overlap_samples,
+				filter_data->vad.speech_frames.end());
+		} else {
+			filter_data->vad.overlap_buffer = filter_data->vad.speech_frames;
+		}
 	}
+
 	filter_data->vad.speaking = false;
 	filter_data->vad.speech_frames.clear();
 	filter_data->vad.speech_ms = 0;
 	filter_data->vad.silence_ms = 0;
 	filter_data->vad.last_partial_ms = 0;
+
+	if (filter_data->vad_ctx)
+		whisper_vad_reset_state(filter_data->vad_ctx);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// ai_filter_audio — OBS audio callback (real-time audio thread)
+//
+// WARNING: NEVER perform network operations or blocking calls here.
+//          Push data into queue (fast lock) and notify worker thread only.
+// ─────────────────────────────────────────────────────────────────────────────
 static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data *audio)
 {
 	ai_filter_data *filter_data = static_cast<ai_filter_data *>(data);
-	if (filter_data->processor && audio->data[0]) {
+
+	// Process audio if any backend is active
+	bool has_backend =
+		(filter_data->processor != nullptr || filter_data->remote_client != nullptr);
+
+	if (has_backend && audio->data[0]) {
 		float *raw_audio = (float *)audio->data[0];
 		size_t num_samples = audio->frames;
 		struct obs_audio_info oai;
+
 		if (obs_get_audio_info(&oai)) {
 			std::vector<float> pcmf32;
 
+			// Resample to 16kHz (if OBS input uses different rate, e.g., 48kHz)
 			if (oai.samples_per_sec != 16000) {
-				double ratio = (double)oai.samples_per_sec / 16000.0;
-				size_t out_frames = (size_t)(num_samples / ratio);
-				pcmf32.reserve(out_frames);
-				for (size_t i = 0; i < out_frames; ++i) {
-					double pos = i * ratio;
-					size_t index = (size_t)pos;
-					double frac = pos - index;
-					if (index + 1 < num_samples) {
-						pcmf32.push_back((float)(raw_audio[index] * (1.0 - frac) + raw_audio[index + 1] * frac));
-					} else {
-						pcmf32.push_back(raw_audio[index]);
+				if (!filter_data->resampler ||
+				    filter_data->resampler_src_rate != oai.samples_per_sec) {
+					if (filter_data->resampler)
+						audio_resampler_destroy(filter_data->resampler);
+
+					struct resample_info src_info = {oai.samples_per_sec,
+					                                 AUDIO_FORMAT_FLOAT, SPEAKERS_MONO};
+					struct resample_info dst_info = {16000, AUDIO_FORMAT_FLOAT,
+					                                 SPEAKERS_MONO};
+					filter_data->resampler =
+						audio_resampler_create(&dst_info, &src_info);
+					filter_data->resampler_src_rate = oai.samples_per_sec;
+				}
+
+				if (filter_data->resampler) {
+					const uint8_t *input_data[MAX_AV_PLANES] = {
+						(const uint8_t *)raw_audio};
+					uint8_t *output_data[MAX_AV_PLANES] = {nullptr};
+					uint32_t out_frames = 0;
+					uint64_t ts_offset = 0;
+
+					if (audio_resampler_resample(filter_data->resampler, output_data,
+					                             &out_frames, &ts_offset, input_data,
+					                             (uint32_t)num_samples)) {
+						if (out_frames > 0 && output_data[0]) {
+							float *resampled = (float *)output_data[0];
+							pcmf32.assign(resampled, resampled + out_frames);
+						}
 					}
 				}
 			} else {
@@ -475,16 +785,25 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 			}
 
 			if (!pcmf32.empty()) {
+				// Remove DC offset
+				float mean = 0.0f;
+				for (float s : pcmf32)
+					mean += s;
+				mean /= pcmf32.size();
+				for (float &s : pcmf32)
+					s -= mean;
+
+				// Calculate RMS for quick silence detection
 				float sum = 0.0f;
-				for (float sample : pcmf32) {
-					sum += sample * sample;
-				}
+				for (float s : pcmf32)
+					sum += s * s;
 				float rms = std::sqrt(sum / pcmf32.size());
 
+				// VAD: detect speech
 				bool is_speech = false;
 				if (rms > SILENCE_RMS_THRESHOLD) {
-					is_speech = whisper_vad_detect_speech_no_reset(filter_data->vad_ctx, pcmf32.data(),
-											    pcmf32.size());
+					is_speech = whisper_vad_detect_speech_no_reset(
+						filter_data->vad_ctx, pcmf32.data(), pcmf32.size());
 				}
 
 				size_t frame_ms = (pcmf32.size() * 1000) / 16000;
@@ -492,38 +811,46 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 				if (is_speech) {
 					if (!filter_data->vad.speaking) {
 						filter_data->vad.speaking = true;
-						filter_data->vad.speech_frames = filter_data->vad.preroll;
+						filter_data->vad.speech_frames = filter_data->vad.overlap_buffer;
+						filter_data->vad.speech_frames.insert(
+							filter_data->vad.speech_frames.end(),
+							filter_data->vad.preroll.begin(),
+							filter_data->vad.preroll.end());
+						filter_data->vad.overlap_buffer.clear();
 						filter_data->vad.speech_ms =
 							(filter_data->vad.speech_frames.size() * 1000) / 16000;
 					}
 
-					filter_data->vad.speech_frames.insert(filter_data->vad.speech_frames.end(),
-									      pcmf32.begin(), pcmf32.end());
+					filter_data->vad.speech_frames.insert(
+						filter_data->vad.speech_frames.end(), pcmf32.begin(),
+						pcmf32.end());
 					filter_data->vad.speech_ms += frame_ms;
 					filter_data->vad.silence_ms = 0;
 
-					if (filter_data->vad.speech_ms - filter_data->vad.last_partial_ms >= 1000) {
+					// Send partial segment every second for low latency
+					if (filter_data->vad.speech_ms - filter_data->vad.last_partial_ms >=
+					    1000) {
 						filter_data->vad.last_partial_ms = filter_data->vad.speech_ms;
-
 						AudioSegment seg;
 						seg.audio = filter_data->vad.speech_frames;
 						seg.is_final = false;
 						seg.sentence_id = filter_data->vad.sentence_id;
-
 						{
-							std::lock_guard<std::mutex> lock(filter_data->queue_mutex);
+							std::lock_guard<std::mutex> lock(
+								filter_data->queue_mutex);
 							filter_data->segment_queue.push(seg);
 						}
 						filter_data->cv.notify_one();
 					}
 				} else {
-					filter_data->vad.preroll.insert(filter_data->vad.preroll.end(), pcmf32.begin(),
-									pcmf32.end());
+					filter_data->vad.preroll.insert(filter_data->vad.preroll.end(),
+					                                pcmf32.begin(), pcmf32.end());
 					if (filter_data->vad.preroll.size() > (PREROLL_MS * 16)) {
 						filter_data->vad.preroll.erase(
 							filter_data->vad.preroll.begin(),
 							filter_data->vad.preroll.begin() +
-								(filter_data->vad.preroll.size() - (PREROLL_MS * 16)));
+								(filter_data->vad.preroll.size() -
+								 (PREROLL_MS * 16)));
 					}
 
 					if (filter_data->vad.speaking) {
@@ -537,12 +864,12 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 						} else if (filter_data->vad.speech_ms -
 								   filter_data->vad.last_partial_ms >=
 							   1000) {
-							filter_data->vad.last_partial_ms = filter_data->vad.speech_ms;
+							filter_data->vad.last_partial_ms =
+								filter_data->vad.speech_ms;
 							AudioSegment seg;
 							seg.audio = filter_data->vad.speech_frames;
 							seg.is_final = false;
 							seg.sentence_id = filter_data->vad.sentence_id;
-
 							{
 								std::lock_guard<std::mutex> lock(
 									filter_data->queue_mutex);
@@ -553,7 +880,9 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 					}
 				}
 
-				if (filter_data->vad.speaking && filter_data->vad.speech_ms >= MAX_SEGMENT_MS) {
+				// Force segment flush if speech segment exceeds maximum length
+				if (filter_data->vad.speaking &&
+				    filter_data->vad.speech_ms >= MAX_SEGMENT_MS) {
 					_flush_segment(filter_data);
 				}
 			}
@@ -563,6 +892,9 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 	return audio;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Filter registration with OBS
+// ─────────────────────────────────────────────────────────────────────────────
 extern "C" struct obs_source_info get_ai_filter_info()
 {
 	struct obs_source_info info = {0};
@@ -570,14 +902,11 @@ extern "C" struct obs_source_info get_ai_filter_info()
 	info.type = OBS_SOURCE_TYPE_FILTER;
 	info.output_flags = OBS_SOURCE_AUDIO;
 	info.get_name = ai_filter_get_name;
-
 	info.get_defaults = aI_filter_get_default;
 	info.update = ai_filter_update;
-
 	info.create = ai_filter_create;
 	info.destroy = ai_filter_destroy;
 	info.get_properties = ai_filter_get_properties;
 	info.filter_audio = ai_filter_audio;
-
 	return info;
 }

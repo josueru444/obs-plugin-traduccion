@@ -1,7 +1,3 @@
-//
-// Created by pce on 7/2/26.
-//
-
 #ifndef PLUGINTEMPLATE_FOR_OBS_AUDIO_PROCESSOR_H
 #define PLUGINTEMPLATE_FOR_OBS_AUDIO_PROCESSOR_H
 
@@ -15,11 +11,11 @@ class audio_processor
     audio_processor(const std::string &model_path);
     ~audio_processor();
 
-	std::string process_audio(const std::vector<float> &pcmf32, const std::string &language = "auto", bool translate = false, const std::string &initial_prompt = "");
+	std::string process_audio(const std::vector<float> &pcmf32, const std::string &language = "auto", bool translate = false, const std::string &initial_prompt = "", int n_threads = 4);
 
       private:
     struct whisper_context *ctx = nullptr;
-    // (Opcional) Puedes guardar parámetros de whisper aquí para no crearlos en cada llamada
+    // Store whisper parameters here if needed to avoid recreation per call
     // struct whisper_full_params wparams;
 };
 

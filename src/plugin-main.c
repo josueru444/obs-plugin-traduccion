@@ -25,9 +25,9 @@ OBS_DECLARE_MODULE()
 OBS_MODULE_USE_DEFAULT_LOCALE(PLUGIN_NAME, "en-US")
 
 bool obs_module_load(void) {
-	struct obs_source_info info = get_ai_filter_info(); // Guardamos el valor en una variable
-	obs_register_source(&info);                        // Ahora sí podemos obtener su dirección
-	struct obs_source_info video_info=get_my_font_info();
+	struct obs_source_info info = get_ai_filter_info();
+	obs_register_source(&info);
+	struct obs_source_info video_info = get_my_font_info();
 	obs_register_source(&video_info);
 
 	return true;
