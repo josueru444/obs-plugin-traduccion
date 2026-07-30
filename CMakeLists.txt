@@ -254,7 +254,8 @@ if(MSVC)
     endif()
 endif()
 
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE whisper)
+# Auto-download missing models (tiny, base, small, silero_vad)
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/download_models.cmake")
 
 # Install model files
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/models/"
