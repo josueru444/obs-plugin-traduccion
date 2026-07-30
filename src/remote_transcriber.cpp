@@ -222,14 +222,15 @@ void RemoteTranscriber::update_url(const std::string &new_url)
 
 		blog(LOG_INFO, "[RemoteTranscriber] Update URL to %s", new_url.c_str());
 		m_url = new_url;
+		bool old_tls = m_use_tls;
 		m_use_tls = (m_url.size() >= 6 && m_url.substr(0, 6) == "wss://");
 
 		if (m_connected.load()) {
 			m_connected.store(false);
 			websocketpp::lib::error_code ec;
-			if (m_client_tls)
+			if (old_tls && m_client_tls)
 				m_client_tls->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
-			if (m_client_plain)
+			else if (!old_tls && m_client_plain)
 				m_client_plain->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
 		} else if (!m_url.empty()) {
 			connect();
@@ -358,19 +359,24 @@ void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 		m_status_cb("🔴 Desconectado");
 
 	std::string err_reason = "Unknown error";
-	if (m_use_tls) {
-		auto con = m_client_tls->get_con_from_hdl(hdl);
-		err_reason = con->get_ec().message();
-		if (con->get_response_code() != websocketpp::http::status_code::uninitialized) {
-			err_reason += " (HTTP " + std::to_string(con->get_response_code()) + " " +
-				      con->get_response_msg() + ")";
+	websocketpp::lib::error_code ec;
+	if (m_use_tls && m_client_tls) {
+		auto con = m_client_tls->get_con_from_hdl(hdl, ec);
+		if (!ec && con) {
+			err_reason = con->get_ec().message();
+			if (con->get_response_code() != websocketpp::http::status_code::uninitialized) {
+				err_reason += " (HTTP " + std::to_string(con->get_response_code()) + " " +
+					      con->get_response_msg() + ")";
+			}
 		}
-	} else {
-		auto con = m_client_plain->get_con_from_hdl(hdl);
-		err_reason = con->get_ec().message();
-		if (con->get_response_code() != websocketpp::http::status_code::uninitialized) {
-			err_reason += " (HTTP " + std::to_string(con->get_response_code()) + " " +
-				      con->get_response_msg() + ")";
+	} else if (!m_use_tls && m_client_plain) {
+		auto con = m_client_plain->get_con_from_hdl(hdl, ec);
+		if (!ec && con) {
+			err_reason = con->get_ec().message();
+			if (con->get_response_code() != websocketpp::http::status_code::uninitialized) {
+				err_reason += " (HTTP " + std::to_string(con->get_response_code()) + " " +
+					      con->get_response_msg() + ")";
+			}
 		}
 	}
 
