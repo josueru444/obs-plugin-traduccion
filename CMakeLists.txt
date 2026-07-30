@@ -97,8 +97,7 @@ if(WIN32)
     set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
         opus
-        URL https://github.com/xiph/opus/releases/download/v1.5.2/opus-1.5.2.tar.gz
-        URL_HASH SHA256=65c9f4fc698926e99f022521a44a24d586111ac966fe061ed0760454b6794693
+        URL https://github.com/xiph/opus/archive/refs/tags/v1.5.2.tar.gz
         DOWNLOAD_EXTRACT_TIMESTAMP TRUE
     )
     FetchContent_MakeAvailable(opus)
