@@ -207,6 +207,9 @@ set(WHISPER_ALL_WARNINGS OFF) # Avoid build warnings
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF CACHE BOOL "Export all symbols" FORCE)
 
+# Ensure position-independent code (-fPIC) for static libs linked into shared module (.so)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
 # Disable warnings as errors for 3rd party code
 set(SAVE_WARNINGS_AS_ERRORS ${CMAKE_COMPILE_WARNING_AS_ERROR})
 set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
