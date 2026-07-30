@@ -1,5 +1,5 @@
 # FindOpus.cmake
-# Locate the Opus audio codec library (provided by obs-deps prebuilt packages)
+# Locate the Opus audio codec library (provided by obs-deps prebuilt packages or system)
 #
 # This module defines:
 #   Opus_FOUND        - True if Opus was found
@@ -9,18 +9,20 @@
 
 include(FindPackageHandleStandardArgs)
 
+file(GLOB _obs_deps_dirs "${CMAKE_CURRENT_SOURCE_DIR}/.deps/obs-deps-*")
+
 find_path(
   Opus_INCLUDE_DIR
   NAMES opus/opus.h opus.h
-  HINTS ${CMAKE_PREFIX_PATH}
+  HINTS ${CMAKE_PREFIX_PATH} ${_obs_deps_dirs}
   PATH_SUFFIXES include include/opus
 )
 
 find_library(
   Opus_LIBRARY
-  NAMES opus opus.lib libopus
-  HINTS ${CMAKE_PREFIX_PATH}
-  PATH_SUFFIXES lib lib64 lib/x64
+  NAMES opus libopus opus-0 libopus-0 opusfile libopusfile
+  HINTS ${CMAKE_PREFIX_PATH} ${_obs_deps_dirs}
+  PATH_SUFFIXES lib lib64 lib/x64 bin bin/64bit
 )
 
 find_package_handle_standard_args(
@@ -32,7 +34,9 @@ if(Opus_FOUND AND NOT TARGET Opus::opus)
   add_library(Opus::opus UNKNOWN IMPORTED)
   set_target_properties(
     Opus::opus
-    PROPERTIES IMPORTED_LOCATION "${Opus_LIBRARY}" INTERFACE_INCLUDE_DIRECTORIES "${Opus_INCLUDE_DIR}"
+    PROPERTIES
+      IMPORTED_LOCATION "${Opus_LIBRARY}"
+      INTERFACE_INCLUDE_DIRECTORIES "${Opus_INCLUDE_DIR}"
   )
 endif()
 
