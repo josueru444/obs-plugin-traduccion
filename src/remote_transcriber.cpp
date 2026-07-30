@@ -220,22 +220,16 @@ void RemoteTranscriber::update_url(const std::string &new_url)
 		if (m_url == new_url)
 			return;
 
-		// Cannot switch between ws:// and wss:// at runtime
-		bool new_tls = new_url.size() >= 6 && new_url.substr(0, 6) == "wss://";
-		if (new_tls != m_use_tls) {
-			blog(LOG_WARNING, "[RemoteTranscriber] Cannot switch protocol (ws↔wss) at runtime, ignoring URL change");
-			return;
-		}
-
 		blog(LOG_INFO, "[RemoteTranscriber] Update URL to %s", new_url.c_str());
 		m_url = new_url;
+		m_use_tls = (m_url.size() >= 6 && m_url.substr(0, 6) == "wss://");
 
 		if (m_connected.load()) {
 			m_connected.store(false);
 			websocketpp::lib::error_code ec;
-			if (m_use_tls)
+			if (m_client_tls)
 				m_client_tls->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
-			else
+			if (m_client_plain)
 				m_client_plain->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
 		} else if (!m_url.empty()) {
 			connect();
@@ -247,6 +241,9 @@ void RemoteTranscriber::connect()
 {
 	if (!m_running.load() || m_url.empty())
 		return;
+
+	// Re-evaluate protocol for current URL
+	m_use_tls = (m_url.size() >= 6 && m_url.substr(0, 6) == "wss://");
 
 	if (m_status_cb)
 		m_status_cb("🟡 Conectando...");
@@ -267,11 +264,28 @@ void RemoteTranscriber::connect()
 		con->append_header("ngrok-skip-browser-warning", "true");
 
 		// Set OpenSSL SNI (Server Name Indication) for Cloudflare / LitNG / reverse proxies
-		std::string host = con->get_host();
-		if (!host.empty()) {
-			SSL *ssl = con->get_socket().native_handle();
-			if (ssl) {
-				SSL_set_tlsext_host_name(ssl, host.c_str());
+		// SNI must NOT contain port number and must NOT be an IP address
+		auto uri = con->get_uri();
+		if (uri) {
+			std::string sni_host = uri->get_host();
+			size_t colon_pos = sni_host.find(':');
+			if (colon_pos != std::string::npos) {
+				sni_host = sni_host.substr(0, colon_pos);
+			}
+
+			bool is_ip = !sni_host.empty();
+			for (char c : sni_host) {
+				if (!std::isdigit(c) && c != '.' && c != ':') {
+					is_ip = false;
+					break;
+				}
+			}
+
+			if (!is_ip && !sni_host.empty()) {
+				SSL *ssl = con->get_socket().native_handle();
+				if (ssl) {
+					SSL_set_tlsext_host_name(ssl, sni_host.c_str());
+				}
 			}
 		}
 
