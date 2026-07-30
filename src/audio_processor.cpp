@@ -56,7 +56,7 @@ std::string audio_processor::process_audio(const std::vector<float> &pcmf32, con
 	wparams.logprob_thold = -0.50f;
 	wparams.no_speech_thold = 0.6f;
 
-	if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
+	if (whisper_full(ctx, wparams, pcmf32.data(), (int)pcmf32.size()) != 0) {
 		return "";
 	}
 

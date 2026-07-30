@@ -279,7 +279,7 @@ static void my_font_update(void *data, obs_data_t *settings)
 	MyCaptionsFont *ctx = (MyCaptionsFont *)data;
 
 	obs_data_t *text_settings = obs_data_create();
-	long text_color = obs_data_get_int(settings, "text_color");
+	long text_color = (long)obs_data_get_int(settings, "text_color");
 	apply_text_color(text_settings, text_color);
 	
 	obs_data_set_bool(text_settings, "outline", obs_data_get_bool(settings, "outline"));
@@ -287,7 +287,7 @@ static void my_font_update(void *data, obs_data_t *settings)
 	obs_data_set_bool(text_settings, "drop_shadow", obs_data_get_bool(settings, "drop_shadow"));
 
 	bool word_wrap = obs_data_get_bool(settings, "word_wrap");
-	long custom_width = obs_data_get_int(settings, "custom_width");
+	long custom_width = (long)obs_data_get_int(settings, "custom_width");
 	int max_lines = (int)obs_data_get_int(settings, "max_lines");
 
 	obs_data_t *font_obj = obs_data_get_obj(settings, "font");
@@ -336,7 +336,7 @@ static void my_font_update(void *data, obs_data_t *settings)
 	obs_source_update(ctx->text_font, text_settings);
 	obs_data_release(text_settings);
 
-	long bg_color = obs_data_get_int(settings, "bg_color");
+	long bg_color = (long)obs_data_get_int(settings, "bg_color");
 	if (bg_color != ctx->cached_bg_color) {
 		obs_data_t *bg_settings = obs_data_create();
 		obs_data_set_int(bg_settings, "color", bg_color);

@@ -20,7 +20,13 @@
 #include <websocketpp/config/asio_client.hpp>
 #include <websocketpp/client.hpp>
 
+#if defined(__has_include) && __has_include(<opus/opus.h>)
 #include <opus/opus.h>
+#elif defined(__has_include) && __has_include(<opus.h>)
+#include <opus.h>
+#else
+#include <opus/opus.h>
+#endif
 
 #include <asio/ssl.hpp>
 
