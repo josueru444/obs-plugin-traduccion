@@ -39,7 +39,7 @@ PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
 
 [Files]
-Source: "{#SourceDir}\*"; Excludes: "*.pdb, *.zip, *.exe"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\{#AppName}\*"; Excludes: "*.pdb, *.zip, *.exe"; DestDir: "{app}\plugins\{#AppName}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Code]
 var
