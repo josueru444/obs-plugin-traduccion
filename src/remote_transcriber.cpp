@@ -125,12 +125,15 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 		m_client_tls = std::make_unique<WsClientTls>();
 		m_client_tls->init_asio();
 
-		// TLS context for wss:// connections
+		// TLS context for wss:// connections (support TLS 1.2 & TLS 1.3)
 		m_client_tls->set_tls_init_handler([](websocketpp::connection_hdl) -> SslContext {
 			auto ctx = websocketpp::lib::make_shared<asio::ssl::context>(
-				asio::ssl::context::tlsv12_client);
+				asio::ssl::context::sslv23_client);
+			ctx->set_options(asio::ssl::context::default_workarounds |
+					 asio::ssl::context::no_sslv2 |
+					 asio::ssl::context::no_sslv3);
 			ctx->set_default_verify_paths();
-			// Skip certificate verification for tunnel services (ngrok, Cloudflare, etc.)
+			// Skip certificate verification for tunnel services (ngrok, Cloudflare, LitNG, etc.)
 			ctx->set_verify_mode(asio::ssl::verify_none);
 			return ctx;
 		});
@@ -263,6 +266,15 @@ void RemoteTranscriber::connect()
 		// Skip ngrok free-tier browser interstitial page
 		con->append_header("ngrok-skip-browser-warning", "true");
 
+		// Set OpenSSL SNI (Server Name Indication) for Cloudflare / LitNG / reverse proxies
+		std::string host = con->get_host();
+		if (!host.empty()) {
+			SSL *ssl = con->get_socket().native_handle();
+			if (ssl) {
+				SSL_set_tlsext_host_name(ssl, host.c_str());
+			}
+		}
+
 		m_hdl = con->get_handle();
 		m_client_tls->connect(con);
 	} else {
@@ -327,12 +339,29 @@ void RemoteTranscriber::on_close(websocketpp::connection_hdl hdl)
 
 void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 {
-	(void)hdl;
 	m_connected.store(false);
 	if (m_status_cb)
 		m_status_cb("🔴 Desconectado");
-	blog(LOG_WARNING, "[RemoteTranscriber] Failed to connect to %s, retry in 3s...",
-	     m_url.c_str());
+
+	std::string err_reason = "Unknown error";
+	if (m_use_tls) {
+		auto con = m_client_tls->get_con_from_hdl(hdl);
+		err_reason = con->get_ec().message();
+		if (con->get_response_code() != websocketpp::http::status_code::uninitialized) {
+			err_reason += " (HTTP " + std::to_string(con->get_response_code()) + " " +
+				      con->get_response_msg() + ")";
+		}
+	} else {
+		auto con = m_client_plain->get_con_from_hdl(hdl);
+		err_reason = con->get_ec().message();
+		if (con->get_response_code() != websocketpp::http::status_code::uninitialized) {
+			err_reason += " (HTTP " + std::to_string(con->get_response_code()) + " " +
+				      con->get_response_msg() + ")";
+		}
+	}
+
+	blog(LOG_WARNING, "[RemoteTranscriber] Failed to connect to %s: %s (retry in 3s...)",
+	     m_url.c_str(), err_reason.c_str());
 	schedule_reconnect();
 }
 
