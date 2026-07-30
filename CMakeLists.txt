@@ -91,6 +91,11 @@ pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::OPUS)
 message(STATUS "Opus found: ${OPUS_VERSION}")
 
+# === OpenSSL (required for wss:// TLS WebSocket connections) ===
+find_package(OpenSSL REQUIRED)
+target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
+
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
 

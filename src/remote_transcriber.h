@@ -9,12 +9,16 @@
 #endif
 
 #include <websocketpp/config/asio_no_tls_client.hpp>
+#include <websocketpp/config/asio_client.hpp>
 #include <websocketpp/client.hpp>
 
 #include <opus/opus.h>
 
+#include <asio/ssl.hpp>
+
 #include <atomic>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
@@ -37,6 +41,7 @@ struct TranscriptionResult {
 //   2. Reconnect automatically on connection loss.
 //   3. Encode PCM audio (16kHz, mono, float32) -> Opus and send as binary.
 //   4. Receive JSON response from server and invoke on_result callback.
+//   5. Support both ws:// (plain) and wss:// (TLS) connections.
 //
 // Binary protocol sent to server:
 //   [4 bytes: sentence_id (uint32 LE)]
@@ -45,7 +50,9 @@ struct TranscriptionResult {
 // ─────────────────────────────────────────────────────────────────────────────
 class RemoteTranscriber {
 public:
-	using WsClient = websocketpp::client<websocketpp::config::asio_client>;
+	using WsClientPlain = websocketpp::client<websocketpp::config::asio_client>;
+	using WsClientTls = websocketpp::client<websocketpp::config::asio_tls_client>;
+	using SslContext = websocketpp::lib::shared_ptr<asio::ssl::context>;
 	using ResultCallback = std::function<void(const TranscriptionResult &)>;
 	using StatusCallback = std::function<void(const std::string &)>;
 
@@ -59,6 +66,7 @@ public:
 	/**
 	 * Update WebSocket URL and reconnect if changed.
 	 * Thread-safe: call from any thread.
+	 * Note: cannot switch between ws:// and wss:// at runtime.
 	 *
 	 * @param new_url New WebSocket target URL
 	 */
@@ -85,16 +93,23 @@ private:
 	void on_open(websocketpp::connection_hdl hdl);
 	void on_close(websocketpp::connection_hdl hdl);
 	void on_fail(websocketpp::connection_hdl hdl);
-	void on_message(websocketpp::connection_hdl hdl, WsClient::message_ptr msg);
+
+	// Process incoming text message payload (shared by both client types)
+	void process_message(const std::string &payload);
 
 	// Parse minimal JSON response from server
 	static TranscriptionResult parse_json_response(const std::string &json);
 
+	// ── Helpers for dual-client dispatch ────────────────────────────────────────
+	asio::io_service &get_io_service();
+
 	// ── WebSocket ──────────────────────────────────────────────────────────────
 	std::string m_url;
+	bool m_use_tls{false};
 	ResultCallback m_callback;
 	StatusCallback m_status_cb;
-	WsClient m_client;
+	std::unique_ptr<WsClientPlain> m_client_plain;
+	std::unique_ptr<WsClientTls> m_client_tls;
 	websocketpp::connection_hdl m_hdl;
 	std::thread m_io_thread;
 	std::atomic<bool> m_connected{false};

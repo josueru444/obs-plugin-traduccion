@@ -65,11 +65,38 @@ TranscriptionResult RemoteTranscriber::parse_json_response(const std::string &js
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Helper: get io_service from the active client
+// ─────────────────────────────────────────────────────────────────────────────
+asio::io_service &RemoteTranscriber::get_io_service()
+{
+	if (m_use_tls)
+		return m_client_tls->get_io_service();
+	return m_client_plain->get_io_service();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Process incoming text message (shared logic for both client types)
+// ─────────────────────────────────────────────────────────────────────────────
+void RemoteTranscriber::process_message(const std::string &payload)
+{
+	auto result = parse_json_response(payload);
+
+	if (!result.text.empty() && m_callback) {
+		blog(LOG_INFO, "[RemoteTranscriber] Received response (id=%zu, %s): %s",
+		     result.sentence_id, result.is_final ? "FINAL" : "PARTIAL", result.text.c_str());
+		m_callback(result);
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Constructor
 // ─────────────────────────────────────────────────────────────────────────────
 RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_result, StatusCallback on_status)
-	: m_url(url), m_callback(std::move(on_result)), m_status_cb(std::move(on_status))
+	: m_url(url), m_callback(std::move(on_result)), m_status_cb(std::move(on_status)),
+	  m_use_tls(url.size() >= 6 && url.substr(0, 6) == "wss://")
 {
+	blog(LOG_INFO, "[RemoteTranscriber] Protocol: %s", m_use_tls ? "wss (TLS)" : "ws (plain)");
+
 	// ── Initialize Opus encoder ───────────────────────────────────────────────
 	int err = OPUS_OK;
 	m_encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION_VOIP, &err);
@@ -88,24 +115,53 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 		blog(LOG_INFO, "[RemoteTranscriber] Opus encoder initialized (16kHz, mono, 24kbps)");
 	}
 
-	// ── Initialize WebSocket client ───────────────────────────────────────────
-	m_client.init_asio();
+	// ── Initialize the appropriate WebSocket client ───────────────────────────
+	// Shared event handlers (connection_hdl is the same type for both clients)
+	auto open_handler = [this](websocketpp::connection_hdl hdl) { on_open(hdl); };
+	auto close_handler = [this](websocketpp::connection_hdl hdl) { on_close(hdl); };
+	auto fail_handler = [this](websocketpp::connection_hdl hdl) { on_fail(hdl); };
 
-	// Silence internal logging channels of websocketpp
-	m_client.clear_access_channels(websocketpp::log::alevel::all);
-	m_client.clear_error_channels(websocketpp::log::elevel::all);
+	if (m_use_tls) {
+		m_client_tls = std::make_unique<WsClientTls>();
+		m_client_tls->init_asio();
 
-	// Register event handlers
-	m_client.set_open_handler(
-		[this](websocketpp::connection_hdl hdl) { on_open(hdl); });
-	m_client.set_close_handler(
-		[this](websocketpp::connection_hdl hdl) { on_close(hdl); });
-	m_client.set_fail_handler(
-		[this](websocketpp::connection_hdl hdl) { on_fail(hdl); });
-	m_client.set_message_handler(
-		[this](websocketpp::connection_hdl hdl, WsClient::message_ptr msg) {
-			on_message(hdl, msg);
+		// TLS context for wss:// connections
+		m_client_tls->set_tls_init_handler([](websocketpp::connection_hdl) -> SslContext {
+			auto ctx = websocketpp::lib::make_shared<asio::ssl::context>(
+				asio::ssl::context::tlsv12_client);
+			ctx->set_default_verify_paths();
+			// Skip certificate verification for tunnel services (ngrok, Cloudflare, etc.)
+			ctx->set_verify_mode(asio::ssl::verify_none);
+			return ctx;
 		});
+
+		m_client_tls->clear_access_channels(websocketpp::log::alevel::all);
+		m_client_tls->clear_error_channels(websocketpp::log::elevel::all);
+
+		m_client_tls->set_open_handler(open_handler);
+		m_client_tls->set_close_handler(close_handler);
+		m_client_tls->set_fail_handler(fail_handler);
+		m_client_tls->set_message_handler(
+			[this](websocketpp::connection_hdl, WsClientTls::message_ptr msg) {
+				if (msg->get_opcode() == websocketpp::frame::opcode::text)
+					process_message(msg->get_payload());
+			});
+	} else {
+		m_client_plain = std::make_unique<WsClientPlain>();
+		m_client_plain->init_asio();
+
+		m_client_plain->clear_access_channels(websocketpp::log::alevel::all);
+		m_client_plain->clear_error_channels(websocketpp::log::elevel::all);
+
+		m_client_plain->set_open_handler(open_handler);
+		m_client_plain->set_close_handler(close_handler);
+		m_client_plain->set_fail_handler(fail_handler);
+		m_client_plain->set_message_handler(
+			[this](websocketpp::connection_hdl, WsClientPlain::message_ptr msg) {
+				if (msg->get_opcode() == websocketpp::frame::opcode::text)
+					process_message(msg->get_payload());
+			});
+	}
 
 	// Initiate initial connection if URL non-empty
 	if (!m_url.empty())
@@ -114,7 +170,10 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 	// Run asio io_context in dedicated network thread
 	m_io_thread = std::thread([this]() {
 		blog(LOG_INFO, "[RemoteTranscriber] Network thread started");
-		m_client.run();
+		if (m_use_tls)
+			m_client_tls->run();
+		else
+			m_client_plain->run();
 		blog(LOG_INFO, "[RemoteTranscriber] Network thread stopped");
 	});
 }
@@ -130,7 +189,10 @@ RemoteTranscriber::~RemoteTranscriber()
 	m_connected.store(false);
 
 	// Close WebSocket connection cleanly if active
-	m_client.stop();
+	if (m_use_tls)
+		m_client_tls->stop();
+	else
+		m_client_plain->stop();
 
 	// Wait for network thread to finish execution completely
 	if (m_io_thread.joinable())
@@ -151,9 +213,16 @@ void RemoteTranscriber::update_url(const std::string &new_url)
 	if (!m_running.load())
 		return;
 
-	asio::post(m_client.get_io_service(), [this, new_url]() {
+	asio::post(get_io_service(), [this, new_url]() {
 		if (m_url == new_url)
 			return;
+
+		// Cannot switch between ws:// and wss:// at runtime
+		bool new_tls = new_url.size() >= 6 && new_url.substr(0, 6) == "wss://";
+		if (new_tls != m_use_tls) {
+			blog(LOG_WARNING, "[RemoteTranscriber] Cannot switch protocol (ws↔wss) at runtime, ignoring URL change");
+			return;
+		}
 
 		blog(LOG_INFO, "[RemoteTranscriber] Update URL to %s", new_url.c_str());
 		m_url = new_url;
@@ -161,7 +230,10 @@ void RemoteTranscriber::update_url(const std::string &new_url)
 		if (m_connected.load()) {
 			m_connected.store(false);
 			websocketpp::lib::error_code ec;
-			m_client.close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
+			if (m_use_tls)
+				m_client_tls->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
+			else
+				m_client_plain->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
 		} else if (!m_url.empty()) {
 			connect();
 		}
@@ -176,18 +248,38 @@ void RemoteTranscriber::connect()
 	if (m_status_cb)
 		m_status_cb("🟡 Conectando...");
 
-	websocketpp::lib::error_code ec;
-	auto con = m_client.get_connection(m_url, ec);
-	if (ec) {
-		blog(LOG_ERROR, "[RemoteTranscriber] Connect error to '%s': %s", m_url.c_str(),
-		     ec.message().c_str());
-		if (m_status_cb)
-			m_status_cb("🔴 Desconectado");
-		schedule_reconnect();
-		return;
+	if (m_use_tls) {
+		websocketpp::lib::error_code ec;
+		auto con = m_client_tls->get_connection(m_url, ec);
+		if (ec) {
+			blog(LOG_ERROR, "[RemoteTranscriber] Connect error to '%s': %s", m_url.c_str(),
+			     ec.message().c_str());
+			if (m_status_cb)
+				m_status_cb("🔴 Desconectado");
+			schedule_reconnect();
+			return;
+		}
+
+		// Skip ngrok free-tier browser interstitial page
+		con->append_header("ngrok-skip-browser-warning", "true");
+
+		m_hdl = con->get_handle();
+		m_client_tls->connect(con);
+	} else {
+		websocketpp::lib::error_code ec;
+		auto con = m_client_plain->get_connection(m_url, ec);
+		if (ec) {
+			blog(LOG_ERROR, "[RemoteTranscriber] Connect error to '%s': %s", m_url.c_str(),
+			     ec.message().c_str());
+			if (m_status_cb)
+				m_status_cb("🔴 Desconectado");
+			schedule_reconnect();
+			return;
+		}
+		m_hdl = con->get_handle();
+		m_client_plain->connect(con);
 	}
-	m_hdl = con->get_handle();
-	m_client.connect(con);
+
 	blog(LOG_INFO, "[RemoteTranscriber] Connecting to %s ...", m_url.c_str());
 }
 
@@ -200,7 +292,7 @@ void RemoteTranscriber::schedule_reconnect()
 		m_status_cb("🔴 Desconectado (Reintentando en 3s...)");
 
 	// Use steady_timer to avoid blocking io_context for 3 seconds
-	auto timer = std::make_shared<asio::steady_timer>(m_client.get_io_service(),
+	auto timer = std::make_shared<asio::steady_timer>(get_io_service(),
 	                                                   std::chrono::seconds(3));
 	timer->async_wait([this, timer](const asio::error_code &ec) {
 		if (!ec && m_running.load() && !m_url.empty()) {
@@ -242,23 +334,6 @@ void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 	blog(LOG_WARNING, "[RemoteTranscriber] Failed to connect to %s, retry in 3s...",
 	     m_url.c_str());
 	schedule_reconnect();
-}
-
-void RemoteTranscriber::on_message(websocketpp::connection_hdl hdl, WsClient::message_ptr msg)
-{
-	(void)hdl;
-
-	// Process text messages (JSON) only
-	if (msg->get_opcode() != websocketpp::frame::opcode::text)
-		return;
-
-	auto result = parse_json_response(msg->get_payload());
-
-	if (!result.text.empty() && m_callback) {
-		blog(LOG_INFO, "[RemoteTranscriber] Received response (id=%zu, %s): %s",
-		     result.sentence_id, result.is_final ? "FINAL" : "PARTIAL", result.text.c_str());
-		m_callback(result);
-	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -334,11 +409,14 @@ void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentenc
 	// Post send operation into io_context thread
 	std::string payload(reinterpret_cast<const char *>(message.data()), message.size());
 
-	asio::post(m_client.get_io_service(), [this, payload]() {
+	asio::post(get_io_service(), [this, payload]() {
 		if (!m_connected.load())
 			return;
 		websocketpp::lib::error_code ec;
-		m_client.send(m_hdl, payload, websocketpp::frame::opcode::binary, ec);
+		if (m_use_tls)
+			m_client_tls->send(m_hdl, payload, websocketpp::frame::opcode::binary, ec);
+		else
+			m_client_plain->send(m_hdl, payload, websocketpp::frame::opcode::binary, ec);
 		if (ec) {
 			blog(LOG_ERROR, "[RemoteTranscriber] Send error: %s", ec.message().c_str());
 		}

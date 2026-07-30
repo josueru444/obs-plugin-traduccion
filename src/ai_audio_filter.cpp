@@ -9,6 +9,7 @@
 #include <vector>
 #include <atomic>
 #include <queue>
+#include <deque>
 #include <condition_variable>
 #include <cmath>
 #include <algorithm>
@@ -25,6 +26,11 @@ static const size_t SILENCE_HANGOVER_MS = 600;
 static const size_t MAX_SEGMENT_MS = 15000;
 static const size_t PREROLL_MS = 200;
 static const size_t OVERLAP_MS = 200;
+
+// Maximum confirmed sentences kept in the subtitle ring buffer.
+// The subtitle source's own max_lines UI setting further limits how many
+// lines are actually rendered on screen, so the user stays in control.
+static const size_t MAX_CONFIRMED_LINES = 6;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Data structures
@@ -78,6 +84,25 @@ struct ai_filter_data {
 	uint32_t resampler_src_rate;
 
 	struct whisper_vad_context *vad_ctx;
+
+	// ── Subtitle text accumulation ────────────────────────────────────────
+	// confirmed_lines : ring buffer of final sentences (oldest → newest).
+	// current_partial : latest partial text in progress (shown with "...").
+	// last_displayed  : last string sent to the OBS source; used to skip
+	//                   redundant updates when the text hasn't changed.
+	// subtitle_mutex  : guards all three fields (callback and worker threads).
+	std::deque<std::string> confirmed_lines;
+	std::string             current_partial;
+	std::string             last_displayed;
+	std::mutex              subtitle_mutex;
+
+	// ── Auto-clear & Performance ──────────────────────────────────────────
+	obs_weak_source_t *subtitle_weak_ref{nullptr};
+	std::chrono::steady_clock::time_point last_subtitle_time;
+	std::atomic<bool> subtitle_visible{false};
+	std::thread clear_timer_thread;
+	std::atomic<bool> stop_clear_timer{false};
+	int auto_clear_seconds{5};
 };
 
 // Build full WebSocket URL with token parameter if present
@@ -195,36 +220,114 @@ static std::string sanitize_text(const std::string &text)
 // ─────────────────────────────────────────────────────────────────────────────
 // update_subtitle_source
 //
-// Shared function between local mode (Whisper) and remote mode (WebSocket).
-// In remote mode, invoke from RemoteTranscriber callback (io_context thread).
-// Do not block this execution path.
+// Accumulates confirmed final sentences in a rolling ring buffer and keeps
+// the current partial as a live "in-progress" line. The subtitle source's
+// own max_lines setting (configurable by the user) controls how many lines
+// are ultimately rendered on screen.
+//
+// Behaviour:
+//   is_final=true  → push text to confirmed_lines, clear current_partial.
+//   is_final=false → update current_partial only (no new line added).
+//   Either path    → skip the OBS source write if the display text is
+//                    unchanged (Mejora 3: avoids flicker on identical text).
+//
+// The text NEVER auto-clears; it stays visible until new content replaces it.
 // ─────────────────────────────────────────────────────────────────────────────
 static void update_subtitle_source(ai_filter_data *data, const std::string &text, bool is_final)
 {
-	obs_source_t *custom_source = nullptr;
-	obs_enum_sources(
-		[](void *param, obs_source_t *source) {
-			obs_source_t **found = (obs_source_t **)param;
-			if (strcmp(obs_source_get_unversioned_id(source), "fuente_subtitulos_ia") == 0) {
-				*found = obs_source_get_ref(source);
-				return false;
+	// ── 1. Update the accumulation buffer (thread-safe) ───────────────────
+	std::string display;
+	{
+		std::lock_guard<std::mutex> lock(data->subtitle_mutex);
+
+		if (is_final) {
+			if (!text.empty()) {
+				// Trim individual sentence before storing (safety cap).
+				data->confirmed_lines.push_back(format_subtitles(text, 150));
+				// Evict oldest entry when ring buffer is full.
+				while (data->confirmed_lines.size() > MAX_CONFIRMED_LINES)
+					data->confirmed_lines.pop_front();
 			}
-			return true;
-		},
-		&custom_source);
+			data->current_partial.clear();
+		} else {
+			data->current_partial = text;
+		}
+
+		// ── 2. Build combined display string ─────────────────────────────
+		// Confirmed lines come first (oldest → newest); partial appended last.
+		// Newline separators let the subtitle source apply its max_lines cap.
+		for (const auto &line : data->confirmed_lines) {
+			if (!display.empty())
+				display += '\n';
+			display += line;
+		}
+		if (!data->current_partial.empty()) {
+			if (!display.empty())
+				display += '\n';
+			display += format_subtitles(data->current_partial, 150);
+		}
+
+		// ── 3. Skip OBS update if nothing changed ────────────────────────
+		if (display == data->last_displayed)
+			return;
+		data->last_displayed = display;
+		
+		if (!display.empty()) {
+			data->last_subtitle_time = std::chrono::steady_clock::now();
+			data->subtitle_visible = true;
+		}
+	}
+
+	// ── 4. Push combined text to OBS source (outside the mutex) ──────────
+	obs_source_t *custom_source = nullptr;
+	if (data->subtitle_weak_ref) {
+		custom_source = obs_weak_source_get_source(data->subtitle_weak_ref);
+		if (!custom_source) {
+			obs_weak_source_release(data->subtitle_weak_ref);
+			data->subtitle_weak_ref = nullptr;
+		}
+	}
+	
+	if (!custom_source) {
+		obs_enum_sources(
+			[](void *param, obs_source_t *source) {
+				obs_source_t **found = (obs_source_t **)param;
+				if (strcmp(obs_source_get_unversioned_id(source), "fuente_subtitulos_ia") == 0) {
+					*found = obs_source_get_ref(source);
+					return false;
+				}
+				return true;
+			},
+			&custom_source);
+		if (custom_source) {
+			data->subtitle_weak_ref = obs_source_get_weak_source(custom_source);
+		}
+	}
 
 	if (custom_source != nullptr) {
-		std::string texto_final = is_final ? text : text + "...";
-		std::string texto_fmt = format_subtitles(texto_final, 150);
-
 		obs_data_t *new_settings = obs_data_create();
-		obs_data_set_string(new_settings, "text", texto_fmt.c_str());
+		obs_data_set_string(new_settings, "text", display.c_str());
 		obs_source_update(custom_source, new_settings);
 		obs_data_release(new_settings);
 		obs_source_release(custom_source);
 	}
+}
 
-	(void)data; // reserve for future multi-source support
+static void subtitle_clear_worker(ai_filter_data *data)
+{
+	while (!data->stop_clear_timer.load()) {
+		std::this_thread::sleep_for(std::chrono::milliseconds(500));
+		
+		if (data->subtitle_visible.load() && data->auto_clear_seconds > 0) {
+			auto now = std::chrono::steady_clock::now();
+			auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - data->last_subtitle_time).count();
+			
+			if (duration >= data->auto_clear_seconds) {
+				data->subtitle_visible.store(false);
+				update_subtitle_source(data, "", true);
+			}
+		}
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -269,8 +372,15 @@ static void transcription_worker(ai_filter_data *data)
 
 		if (data->use_remote_transcription && data->remote_client) {
 			// ── Remote mode ───────────────────────────────────────────────────
-			// Send audio only. Response arrives async via RemoteTranscriber callback,
-			// which calls update_subtitle_source().
+			// Obsolete partials for the same sentence_id were already drained from
+			// the queue above (lines 256-264), so we send only the most recent
+			// audio snapshot. The backend applies a second layer of backpressure
+			// (drops partial if Whisper is already busy), so any excess partials
+			// that still reach the server are silently discarded there.
+			blog(LOG_DEBUG,
+			     "[AI Translator] -> Remote: send segment %zu (%s, %zu samples)",
+			     segment.sentence_id, segment.is_final ? "FINAL" : "PARTIAL",
+			     segment.audio.size());
 			data->remote_client->send_audio(segment.audio, segment.sentence_id,
 			                                segment.is_final);
 
@@ -433,6 +543,8 @@ obs_properties_t *ai_filter_get_properties(void *data)
 		OBS_GROUP_CHECKABLE, group_remote);
 	obs_property_set_modified_callback(remote_group, on_remote_transcription_toggled);
 
+	obs_properties_add_int(props, "auto_clear_seconds", "Ocultar tras X segundos de silencio (0=nunca):", 0, 30, 1);
+
 	return props;
 }
 
@@ -467,6 +579,7 @@ static void ai_filter_update(void *data, obs_data_t *settings)
 	fd->local_translation = (fd->target_language == "en");
 	fd->use_gpu = obs_data_get_bool(settings, "processing_mode");
 	fd->whisper_threads = (int)obs_data_get_int(settings, "whisper_threads");
+	fd->auto_clear_seconds = (int)obs_data_get_int(settings, "auto_clear_seconds");
 
 	// Determine Whisper model path
 	std::string old_path = fd->current_model_path;
@@ -498,7 +611,6 @@ static void ai_filter_update(void *data, obs_data_t *settings)
 	std::string new_ws_token = obs_data_get_string(settings, "ws_token");
 
 	std::string new_full_url = build_full_ws_url(new_ws_url, new_ws_token, fd->current_language, fd->target_language);
-
 	// Save updated values in data struct
 	fd->current_model_path = new_path;
 	fd->use_remote_transcription = new_use_remote;
@@ -524,11 +636,19 @@ static void ai_filter_update(void *data, obs_data_t *settings)
 	blog(LOG_INFO, "[AI Translator] Reconfigure backend (mode=%s, path=%s)",
 	     mode_changed ? "changed" : "-", path_changed ? "changed" : "-");
 
-	// ── 1. Stop worker thread ────────────────────────────────────────────────
+	// ── 1. Stop worker thread ────────────────────────────────────────────
 	fd->stop_worker.store(true);
 	fd->cv.notify_all();
 	if (fd->worker_thread.joinable())
 		fd->worker_thread.join();
+
+	// Clear subtitle accumulation so the new backend starts from a clean slate.
+	{
+		std::lock_guard<std::mutex> lock(fd->subtitle_mutex);
+		fd->confirmed_lines.clear();
+		fd->current_partial.clear();
+		fd->last_displayed.clear();
+	}
 
 	// ── 2. Destroy previous backend ──────────────────────────────────────────
 	if (fd->remote_client) {
@@ -584,6 +704,10 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 
 	// Read initial settings into data struct
 	ai_filter_update(data, settings);
+	
+	// Start clear timer thread
+	data->stop_clear_timer.store(false);
+	data->clear_timer_thread = std::thread(subtitle_clear_worker, data);
 
 	// Create appropriate backend based on initial configuration
 	std::string full_url = build_full_ws_url(data->ws_url, data->ws_token, data->current_language, data->target_language);
@@ -620,6 +744,9 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 		data->vad_ctx = nullptr;
 	}
 
+	// Overwrite any hallucinated text saved in OBS scene collection from previous sessions
+	update_subtitle_source(data, "Traductor IA: Listo", true);
+
 	return data;
 }
 
@@ -637,11 +764,20 @@ static void ai_filter_destroy(void *data)
 {
 	ai_filter_data *fd = static_cast<ai_filter_data *>(data);
 
-	// 1. Stop worker thread
+	// 1. Stop worker threads
 	fd->stop_worker.store(true);
 	fd->cv.notify_all();
 	if (fd->worker_thread.joinable())
 		fd->worker_thread.join();
+		
+	fd->stop_clear_timer.store(true);
+	if (fd->clear_timer_thread.joinable())
+		fd->clear_timer_thread.join();
+		
+	if (fd->subtitle_weak_ref) {
+		obs_weak_source_release(fd->subtitle_weak_ref);
+		fd->subtitle_weak_ref = nullptr;
+	}
 
 	// 2. Destroy RemoteTranscriber (destructor waits for network thread)
 	//    MUST happen before freeing fd to prevent callbacks to dangling memory.
@@ -685,6 +821,7 @@ static void aI_filter_get_default(obs_data_t *settings)
 	obs_data_set_default_bool(settings, "use_remote_transcription", false);
 	obs_data_set_default_string(settings, "ws_url", "");
 	obs_data_set_default_string(settings, "ws_token", "");
+	obs_data_set_default_int(settings, "auto_clear_seconds", 5);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

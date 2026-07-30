@@ -26,13 +26,25 @@ static void apply_text_color(obs_data_t *settings, long color)
 struct MyCaptionsFont {
 	obs_source_t *text_font;
 	obs_source_t *color_font;
+	long cached_bg_color;
 };
+
+// Count UTF-8 characters properly
+static size_t utf8_char_count(const std::string &s)
+{
+	size_t count = 0;
+	for (char c : s) {
+		if ((c & 0xC0) != 0x80)
+			count++;
+	}
+	return count;
+}
 
 // Estimate text width for word wrapping
 static float estimate_text_width(const std::string &text, int font_size)
 {
 	const float avg_char_width_ratio = 0.55f;
-	return (float)text.length() * (float)font_size * avg_char_width_ratio;
+	return (float)utf8_char_count(text) * (float)font_size * avg_char_width_ratio;
 }
 
 // Wrap text by words
@@ -81,12 +93,29 @@ static std::string wrap_text_by_words(const std::string &input, int max_width_px
 			line_width = 0.0f;
 		}
 
-		if (!line.empty()) {
-			line += " ";
-			line_width += space_width;
+		if (word_width > (float)max_width_px && line.empty()) {
+			std::string current_chunk;
+			std::string last_valid_chunk;
+			for (char c : word) {
+				current_chunk += c;
+				if ((c & 0xC0) != 0x80) {
+					if (estimate_text_width(current_chunk, font_size) > (float)max_width_px && !last_valid_chunk.empty()) {
+						result += last_valid_chunk + "\n";
+						current_chunk = current_chunk.substr(last_valid_chunk.length());
+					}
+					last_valid_chunk = current_chunk;
+				}
+			}
+			line = current_chunk;
+			line_width = estimate_text_width(line, font_size);
+		} else {
+			if (!line.empty()) {
+				line += " ";
+				line_width += space_width;
+			}
+			line += word;
+			line_width += word_width;
 		}
-		line += word;
-		line_width += word_width;
 	}
 	result += line;
 
@@ -100,9 +129,10 @@ static void *my_font_create(obs_data_t *settings, obs_source_t *source)
 	(void)settings;
 
 	MyCaptionsFont *data = (MyCaptionsFont *)malloc(sizeof(MyCaptionsFont));
+	data->cached_bg_color = -1;
 
 	obs_data_t *text_defaults = obs_data_create();
-	obs_data_set_string(text_defaults, "text", "Esperando Herramienta de Traducción...");
+	obs_data_set_string(text_defaults, "text", "Subtítulos IA (Esperando...)");
 	apply_text_color(text_defaults, 0xFFFFFFFF);
 
 	obs_data_t *font_obj = obs_data_create();
@@ -144,12 +174,14 @@ static void my_font_render(void *data, gs_effect_t *effect)
 	uint32_t cx = obs_source_get_width(ctx->text_font);
 	uint32_t cy = obs_source_get_height(ctx->text_font);
 
-	gs_matrix_push();
-	struct vec3 scale;
-	vec3_set(&scale, (float)(cx + 20), (float)(cy + 20), 1.0f);
-	gs_matrix_scale(&scale);
-	obs_source_video_render(ctx->color_font);
-	gs_matrix_pop();
+	if (cx > 0 && cy > 0) {
+		gs_matrix_push();
+		struct vec3 scale;
+		vec3_set(&scale, (float)(cx + 20), (float)(cy + 20), 1.0f);
+		gs_matrix_scale(&scale);
+		obs_source_video_render(ctx->color_font);
+		gs_matrix_pop();
+	}
 
 	gs_matrix_push();
 	struct vec3 offset;
@@ -195,6 +227,9 @@ static obs_properties_t *my_font_get_properties(void *data)
 	obs_properties_t *group_appearance = obs_properties_create();
 	obs_properties_add_font(group_appearance, "font", "Tipografía:");
 	obs_properties_add_color_alpha(group_appearance, "text_color", "Color de Letras:");
+	obs_properties_add_bool(group_appearance, "outline", "Contorno de Texto");
+	obs_properties_add_color_alpha(group_appearance, "outline_color", "Color del Contorno:");
+	obs_properties_add_bool(group_appearance, "drop_shadow", "Sombra Paralela");
 	obs_properties_add_color_alpha(group_appearance, "bg_color", "Color de Fondo:");
 
 	obs_properties_add_group(props, "grp_appearance", "1. Estilo de Fuente y Colores",
@@ -220,6 +255,9 @@ static obs_properties_t *my_font_get_properties(void *data)
 static void my_font_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_int(settings, "text_color", 0xFFFFFFFF);
+	obs_data_set_default_bool(settings, "outline", false);
+	obs_data_set_default_int(settings, "outline_color", 0xFF000000);
+	obs_data_set_default_bool(settings, "drop_shadow", false);
 	obs_data_set_default_int(settings, "bg_color", 0x80000000);
 
 	obs_data_set_default_bool(settings, "word_wrap", true);
@@ -243,6 +281,10 @@ static void my_font_update(void *data, obs_data_t *settings)
 	obs_data_t *text_settings = obs_data_create();
 	long text_color = obs_data_get_int(settings, "text_color");
 	apply_text_color(text_settings, text_color);
+	
+	obs_data_set_bool(text_settings, "outline", obs_data_get_bool(settings, "outline"));
+	obs_data_set_int(text_settings, "outline_color", obs_data_get_int(settings, "outline_color"));
+	obs_data_set_bool(text_settings, "drop_shadow", obs_data_get_bool(settings, "drop_shadow"));
 
 	bool word_wrap = obs_data_get_bool(settings, "word_wrap");
 	long custom_width = obs_data_get_int(settings, "custom_width");
@@ -271,7 +313,7 @@ static void my_font_update(void *data, obs_data_t *settings)
 	}
 
 	const char *new_text = obs_data_get_string(settings, "text");
-	std::string text_to_set = (new_text && strlen(new_text) > 0) ? new_text : "Esperando Herramienta de Traducción...";
+	std::string text_to_set = (new_text) ? new_text : "";
 
 	if (word_wrap) {
 		text_to_set = wrap_text_by_words(text_to_set, (int)custom_width, font_size);
@@ -294,14 +336,16 @@ static void my_font_update(void *data, obs_data_t *settings)
 	obs_source_update(ctx->text_font, text_settings);
 	obs_data_release(text_settings);
 
-	obs_data_t *bg_settings = obs_data_create();
 	long bg_color = obs_data_get_int(settings, "bg_color");
-	obs_data_set_int(bg_settings, "color", bg_color);
-	obs_data_set_int(bg_settings, "width", 1);
-	obs_data_set_int(bg_settings, "height", 1);
-
-	obs_source_update(ctx->color_font, bg_settings);
-	obs_data_release(bg_settings);
+	if (bg_color != ctx->cached_bg_color) {
+		obs_data_t *bg_settings = obs_data_create();
+		obs_data_set_int(bg_settings, "color", bg_color);
+		obs_data_set_int(bg_settings, "width", 1);
+		obs_data_set_int(bg_settings, "height", 1);
+		obs_source_update(ctx->color_font, bg_settings);
+		obs_data_release(bg_settings);
+		ctx->cached_bg_color = bg_color;
+	}
 }
 
 // Define source info struct
