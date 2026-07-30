@@ -203,6 +203,10 @@ endif()
 
 set(WHISPER_ALL_WARNINGS OFF) # Avoid build warnings
 
+# Build whisper.cpp statically to prevent __create_def crash on Windows and missing DLLs
+set(SAVE_BUILD_SHARED_LIBS ${BUILD_SHARED_LIBS})
+set(BUILD_SHARED_LIBS OFF)
+
 # Disable warnings as errors for 3rd party code
 set(SAVE_WARNINGS_AS_ERRORS ${CMAKE_COMPILE_WARNING_AS_ERROR})
 set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
@@ -210,6 +214,7 @@ set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
 add_subdirectory(vendor/whisper.cpp SYSTEM)
 
 set(CMAKE_COMPILE_WARNING_AS_ERROR ${SAVE_WARNINGS_AS_ERRORS})
+set(BUILD_SHARED_LIBS ${SAVE_BUILD_SHARED_LIBS})
 
 # Extra safety patch for GCC/Clang:
 if(NOT MSVC)
