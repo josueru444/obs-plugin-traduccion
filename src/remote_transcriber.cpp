@@ -67,11 +67,12 @@ TranscriptionResult RemoteTranscriber::parse_json_response(const std::string &js
 // ─────────────────────────────────────────────────────────────────────────────
 // Helper: get io_service from the active client
 // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: get io_service
+// ─────────────────────────────────────────────────────────────────────────────
 asio::io_service &RemoteTranscriber::get_io_service()
 {
-	if (m_use_tls)
-		return m_client_tls->get_io_service();
-	return m_client_plain->get_io_service();
+	return m_io_service;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +94,8 @@ void RemoteTranscriber::process_message(const std::string &payload)
 // ─────────────────────────────────────────────────────────────────────────────
 RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_result, StatusCallback on_status)
 	: m_url(url), m_callback(std::move(on_result)), m_status_cb(std::move(on_status)),
-	  m_use_tls(url.size() >= 6 && url.substr(0, 6) == "wss://")
+	  m_use_tls(url.size() >= 6 && url.substr(0, 6) == "wss://"),
+	  m_work_guard(asio::make_work_guard(m_io_service))
 {
 	blog(LOG_INFO, "[RemoteTranscriber] Protocol: %s", m_use_tls ? "wss (TLS)" : "ws (plain)");
 
@@ -115,70 +117,62 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 		blog(LOG_INFO, "[RemoteTranscriber] Opus encoder initialized (16kHz, mono, 24kbps)");
 	}
 
-	// ── Initialize the appropriate WebSocket client ───────────────────────────
-	// Shared event handlers (connection_hdl is the same type for both clients)
+	// ── Initialize BOTH WebSocket clients on shared io_service ───────────────
 	auto open_handler = [this](websocketpp::connection_hdl hdl) { on_open(hdl); };
 	auto close_handler = [this](websocketpp::connection_hdl hdl) { on_close(hdl); };
 	auto fail_handler = [this](websocketpp::connection_hdl hdl) { on_fail(hdl); };
 
-	if (m_use_tls) {
-		m_client_tls = std::make_unique<WsClientTls>();
-		m_client_tls->init_asio();
-
-		// TLS context for wss:// connections (support TLS 1.2 & TLS 1.3)
-		m_client_tls->set_tls_init_handler([](websocketpp::connection_hdl) -> SslContext {
-			auto ctx = websocketpp::lib::make_shared<asio::ssl::context>(
-				asio::ssl::context::sslv23_client);
-			ctx->set_options(asio::ssl::context::default_workarounds |
-					 asio::ssl::context::no_sslv2 |
-					 asio::ssl::context::no_sslv3);
-			ctx->set_default_verify_paths();
-			// Skip certificate verification for tunnel services (ngrok, Cloudflare, LitNG, etc.)
-			ctx->set_verify_mode(asio::ssl::verify_none);
-			return ctx;
+	// 1. TLS Client (for wss://)
+	m_client_tls = std::make_unique<WsClientTls>();
+	m_client_tls->init_asio(&m_io_service);
+	m_client_tls->set_tls_init_handler([](websocketpp::connection_hdl) -> SslContext {
+		auto ctx = websocketpp::lib::make_shared<asio::ssl::context>(
+			asio::ssl::context::sslv23_client);
+		ctx->set_options(asio::ssl::context::default_workarounds |
+				 asio::ssl::context::no_sslv2 |
+				 asio::ssl::context::no_sslv3);
+		ctx->set_default_verify_paths();
+		ctx->set_verify_mode(asio::ssl::verify_none);
+		return ctx;
+	});
+	m_client_tls->clear_access_channels(websocketpp::log::alevel::all);
+	m_client_tls->clear_error_channels(websocketpp::log::elevel::all);
+	m_client_tls->set_open_handler(open_handler);
+	m_client_tls->set_close_handler(close_handler);
+	m_client_tls->set_fail_handler(fail_handler);
+	m_client_tls->set_message_handler(
+		[this](websocketpp::connection_hdl, WsClientTls::message_ptr msg) {
+			if (msg->get_opcode() == websocketpp::frame::opcode::text)
+				process_message(msg->get_payload());
 		});
 
-		m_client_tls->clear_access_channels(websocketpp::log::alevel::all);
-		m_client_tls->clear_error_channels(websocketpp::log::elevel::all);
+	// 2. Plain Client (for ws://)
+	m_client_plain = std::make_unique<WsClientPlain>();
+	m_client_plain->init_asio(&m_io_service);
+	m_client_plain->clear_access_channels(websocketpp::log::alevel::all);
+	m_client_plain->clear_error_channels(websocketpp::log::elevel::all);
+	m_client_plain->set_open_handler(open_handler);
+	m_client_plain->set_close_handler(close_handler);
+	m_client_plain->set_fail_handler(fail_handler);
+	m_client_plain->set_message_handler(
+		[this](websocketpp::connection_hdl, WsClientPlain::message_ptr msg) {
+			if (msg->get_opcode() == websocketpp::frame::opcode::text)
+				process_message(msg->get_payload());
+		});
 
-		m_client_tls->set_open_handler(open_handler);
-		m_client_tls->set_close_handler(close_handler);
-		m_client_tls->set_fail_handler(fail_handler);
-		m_client_tls->set_message_handler(
-			[this](websocketpp::connection_hdl, WsClientTls::message_ptr msg) {
-				if (msg->get_opcode() == websocketpp::frame::opcode::text)
-					process_message(msg->get_payload());
-			});
-	} else {
-		m_client_plain = std::make_unique<WsClientPlain>();
-		m_client_plain->init_asio();
-
-		m_client_plain->clear_access_channels(websocketpp::log::alevel::all);
-		m_client_plain->clear_error_channels(websocketpp::log::elevel::all);
-
-		m_client_plain->set_open_handler(open_handler);
-		m_client_plain->set_close_handler(close_handler);
-		m_client_plain->set_fail_handler(fail_handler);
-		m_client_plain->set_message_handler(
-			[this](websocketpp::connection_hdl, WsClientPlain::message_ptr msg) {
-				if (msg->get_opcode() == websocketpp::frame::opcode::text)
-					process_message(msg->get_payload());
-			});
-	}
-
-	// Initiate initial connection if URL non-empty
-	if (!m_url.empty())
-		connect();
-
-	// Run asio io_context in dedicated network thread
+	// Run asio io_service in single dedicated network thread
 	m_io_thread = std::thread([this]() {
 		blog(LOG_INFO, "[RemoteTranscriber] Network thread started");
-		if (m_use_tls)
-			m_client_tls->run();
-		else
-			m_client_plain->run();
+		m_io_service.run();
 		blog(LOG_INFO, "[RemoteTranscriber] Network thread stopped");
 	});
+
+	// Initiate initial connection if URL non-empty
+	if (!m_url.empty()) {
+		asio::post(m_io_service, [this]() {
+			connect();
+		});
+	}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -191,11 +185,14 @@ RemoteTranscriber::~RemoteTranscriber()
 	m_running.store(false);
 	m_connected.store(false);
 
-	// Close WebSocket connection cleanly if active
-	if (m_use_tls)
+	// Stop both clients cleanly
+	if (m_client_tls)
 		m_client_tls->stop();
-	else
+	if (m_client_plain)
 		m_client_plain->stop();
+
+	m_work_guard.reset();
+	m_io_service.stop();
 
 	// Wait for network thread to finish execution completely
 	if (m_io_thread.joinable())
@@ -208,6 +205,11 @@ RemoteTranscriber::~RemoteTranscriber()
 	}
 }
 
+static bool is_same_hdl(const websocketpp::connection_hdl &h1, const websocketpp::connection_hdl &h2)
+{
+	return !h1.owner_before(h2) && !h2.owner_before(h1);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Connection management
 // ─────────────────────────────────────────────────────────────────────────────
@@ -217,37 +219,59 @@ void RemoteTranscriber::update_url(const std::string &new_url)
 		return;
 
 	asio::post(get_io_service(), [this, new_url]() {
-		if (m_url == new_url)
-			return;
-
 		blog(LOG_INFO, "[RemoteTranscriber] Update URL to %s", new_url.c_str());
-		m_url = new_url;
-		bool old_tls = m_use_tls;
-		m_use_tls = (m_url.size() >= 6 && m_url.substr(0, 6) == "wss://");
-
-		if (m_connected.load()) {
-			m_connected.store(false);
-			websocketpp::lib::error_code ec;
-			if (old_tls && m_client_tls)
-				m_client_tls->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
-			else if (!old_tls && m_client_plain)
-				m_client_plain->close(m_hdl, websocketpp::close::status::going_away, "URL changed", ec);
-		} else if (!m_url.empty()) {
-			connect();
+		if (m_url == new_url && m_connected.load()) {
+			// If the URL hasn't changed and we are already connected, do not reconnect.
+			// This allows the update_url function to act as a "refresh status" action.
+			if (m_status_cb)
+				m_status_cb("🟢 Conectado");
+			return;
 		}
+		m_url = new_url;
+		connect();
 	});
 }
 
+
 void RemoteTranscriber::connect()
 {
-	if (!m_running.load() || m_url.empty())
+	if (!m_running.load())
 		return;
 
+	// Close old connection safely if active before starting a new one
+	m_connected.store(false);
+	if (!m_hdl.expired()) {
+		websocketpp::lib::error_code ec;
+		if (m_use_tls && m_client_tls)
+			m_client_tls->close(m_hdl, websocketpp::close::status::going_away, "Reconnecting", ec);
+		else if (!m_use_tls && m_client_plain)
+			m_client_plain->close(m_hdl, websocketpp::close::status::going_away, "Reconnecting", ec);
+		m_hdl.reset();
+	}
+
+	if (m_url.empty()) {
+		if (m_status_cb)
+			m_status_cb("🔴 Desconectado");
+		return;
+	}
+
+	// Validate URL scheme before any connection attempt.
+	// websocketpp crashes on URIs like "ws:localhost" (missing "//").
+	bool is_ws  = (m_url.size() >= 5 && m_url.substr(0, 5) == "ws://");
+	bool is_wss = (m_url.size() >= 6 && m_url.substr(0, 6) == "wss://");
+	if (!is_ws && !is_wss) {
+		blog(LOG_WARNING, "[RemoteTranscriber] Invalid URL scheme, ignoring: %s", m_url.c_str());
+		if (m_status_cb)
+			m_status_cb("🔴 URL inválida");
+		return;
+	}
+
 	// Re-evaluate protocol for current URL
-	m_use_tls = (m_url.size() >= 6 && m_url.substr(0, 6) == "wss://");
+	m_use_tls = is_wss;
 
 	if (m_status_cb)
 		m_status_cb("🟡 Conectando...");
+
 
 	if (m_use_tls) {
 		websocketpp::lib::error_code ec;
@@ -335,7 +359,9 @@ void RemoteTranscriber::schedule_reconnect()
 // ─────────────────────────────────────────────────────────────────────────────
 void RemoteTranscriber::on_open(websocketpp::connection_hdl hdl)
 {
-	m_hdl = hdl;
+	if (!is_same_hdl(hdl, m_hdl))
+		return;
+
 	m_connected.store(true);
 	if (m_status_cb)
 		m_status_cb("🟢 Conectado");
@@ -344,7 +370,9 @@ void RemoteTranscriber::on_open(websocketpp::connection_hdl hdl)
 
 void RemoteTranscriber::on_close(websocketpp::connection_hdl hdl)
 {
-	(void)hdl;
+	if (!is_same_hdl(hdl, m_hdl))
+		return;
+
 	m_connected.store(false);
 	if (m_status_cb)
 		m_status_cb("🔴 Desconectado");
@@ -354,6 +382,9 @@ void RemoteTranscriber::on_close(websocketpp::connection_hdl hdl)
 
 void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 {
+	if (!is_same_hdl(hdl, m_hdl))
+		return;
+
 	m_connected.store(false);
 	if (m_status_cb)
 		m_status_cb("🔴 Desconectado");

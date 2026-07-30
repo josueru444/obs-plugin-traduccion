@@ -114,6 +114,10 @@ static std::string build_full_ws_url(const std::string &url, const std::string &
 
 	auto append_param = [&](const std::string &key, const std::string &val) {
 		if (val.empty()) return;
+		// Do not duplicate parameter if already present in full_url
+		if (has_query && (full_url.find("?" + key + "=") != std::string::npos || full_url.find("&" + key + "=") != std::string::npos))
+			return;
+
 		if (has_query) full_url += "&" + key + "=" + val;
 		else { full_url += "?" + key + "=" + val; has_query = true; }
 	};
@@ -405,20 +409,44 @@ static void transcription_worker(ai_filter_data *data)
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Refresh connection status manually from the UI
-static bool on_refresh_status_clicked(obs_properties_t *props, obs_property_t *p, void *data)
+// Connect button: reads current URL+Token from settings and connects immediately
+static bool on_connect_clicked(obs_properties_t *props, obs_property_t *p, void *data)
 {
+	(void)props;
 	(void)p;
 	ai_filter_data *fd = static_cast<ai_filter_data *>(data);
-	std::string status_msg = "⚪ Inactivo (Modo local activo)";
+	if (!fd || !fd->remote_client)
+		return false;
 
-	if (fd && fd->use_remote_transcription) {
+	std::string full_url = build_full_ws_url(fd->ws_url, fd->ws_token,
+	                                          fd->current_language, fd->target_language);
+
+	if (full_url.empty()) {
+		blog(LOG_INFO, "[AI Translator] Connect button pressed with empty URL -> Disconnecting");
+	} else {
+		blog(LOG_INFO, "[AI Translator] Connect button pressed -> %s", full_url.c_str());
+	}
+	fd->remote_client->update_url(full_url);
+
+	bool url_changed = (full_url != fd->remote_client->get_url());
+	bool is_connected = fd->remote_client->is_connected();
+
+	// Optimistically update the UI to show that an action is taking place.
+	// The true status will be updated asynchronously.
+	std::string optimistic_status;
+	if (full_url.empty()) {
+		optimistic_status = "🔴 Desconectado";
+	} else if (url_changed || !is_connected) {
+		optimistic_status = "🟡 Conectando / Verificando...";
+	} else {
+		// URL didn't change and we are already connected. Fetch the true status from the background thread safely.
 		std::lock_guard<std::mutex> lock(fd->status_mutex);
-		status_msg = fd->connection_status;
+		optimistic_status = fd->connection_status;
 	}
 
 	obs_property_t *status_prop = obs_properties_get(props, "status_label");
 	if (status_prop) {
-		obs_property_set_description(status_prop, ("Estado: " + status_msg).c_str());
+		obs_property_set_description(status_prop, ("Estado: " + optimistic_status).c_str());
 	}
 
 	return true; // Force UI refresh
@@ -528,8 +556,8 @@ obs_properties_t *ai_filter_get_properties(void *data)
 	}
 	obs_properties_add_text(group_remote, "status_label", ("Estado: " + status_msg).c_str(),
 	                        OBS_TEXT_INFO);
-	obs_properties_add_button(group_remote, "refresh_status_btn", "↻ Actualizar Estado",
-	                          on_refresh_status_clicked);
+	obs_properties_add_button(group_remote, "connect_btn", "🔌 Conectar / Refrescar",
+	                          on_connect_clicked);
 
 	obs_properties_add_text(
 		group_remote, "remote_info",
@@ -622,11 +650,9 @@ static void ai_filter_update(void *data, obs_data_t *settings)
 	bool mode_changed = has_backend && (new_use_remote != old_use_remote);
 	bool path_changed = has_backend && !new_use_remote && (new_path != old_path);
 
-	// If remote mode is active and only URL/Token changed, update URL in-place without destroying thread
+	// If remote mode is active and only URL/Token changed, just save the values.
+	// The user must press the "Conectar" button to apply the new URL.
 	if (has_backend && !mode_changed && new_use_remote && fd->remote_client) {
-		if (new_full_url != old_full_url) {
-			fd->remote_client->update_url(new_full_url);
-		}
 		return;
 	}
 
@@ -711,8 +737,8 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 
 	// Create appropriate backend based on initial configuration
 	std::string full_url = build_full_ws_url(data->ws_url, data->ws_token, data->current_language, data->target_language);
-	if (data->use_remote_transcription && !full_url.empty()) {
-		blog(LOG_INFO, "[AI Translator] Create with remote mode -> %s", full_url.c_str());
+	if (data->use_remote_transcription) {
+		blog(LOG_INFO, "[AI Translator] Create with remote mode -> %s", full_url.empty() ? "(empty url)" : full_url.c_str());
 		auto result_cb = [data](const TranscriptionResult &r) {
 			std::string texto = sanitize_text(r.text);
 			if (!texto.empty()) {

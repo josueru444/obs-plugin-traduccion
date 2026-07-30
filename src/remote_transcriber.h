@@ -97,6 +97,7 @@ public:
 	void send_audio(const std::vector<float> &pcm_16khz, size_t sentence_id, bool is_final);
 
 	bool is_connected() const { return m_connected.load(); }
+	std::string get_url() const { return m_url; }
 
 private:
 	// Manage connection
@@ -122,6 +123,8 @@ private:
 	bool m_use_tls{false};
 	ResultCallback m_callback;
 	StatusCallback m_status_cb;
+	asio::io_service m_io_service;
+	asio::executor_work_guard<asio::io_service::executor_type> m_work_guard;
 	std::unique_ptr<WsClientPlain> m_client_plain;
 	std::unique_ptr<WsClientTls> m_client_tls;
 	websocketpp::connection_hdl m_hdl;
