@@ -39,7 +39,8 @@ PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
 
 [Files]
-Source: "{#SourceDir}\{#AppName}\*"; Excludes: "*.pdb, *.zip, *.exe"; DestDir: "{app}\plugins\{#AppName}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\{#AppName}\bin\64bit\*"; Excludes: "*.pdb, *.zip, *.exe"; DestDir: "{app}\obs-plugins\64bit"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\{#AppName}\data\*"; DestDir: "{app}\data\obs-plugins\{#AppName}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Code]
 var
