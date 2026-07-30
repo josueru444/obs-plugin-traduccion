@@ -202,7 +202,7 @@ if(NOT MSVC)
 endif()
 
 set(WHISPER_ALL_WARNINGS OFF) # Avoid build warnings
-add_subdirectory(vendor/whisper.cpp)
+add_subdirectory(vendor/whisper.cpp SYSTEM)
 # Extra safety patch for GCC/Clang:
 if(NOT MSVC)
     target_compile_options(whisper PRIVATE -Wno-error=format-truncation)

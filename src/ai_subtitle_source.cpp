@@ -321,7 +321,7 @@ static void my_font_update(void *data, obs_data_t *settings)
 
 	if (max_lines > 0) {
 		int newlines_found = 0;
-		for (int i = text_to_set.length() - 1; i >= 0; --i) {
+		for (int i = (int)text_to_set.length() - 1; i >= 0; --i) {
 			if (text_to_set[i] == '\n') {
 				newlines_found++;
 				if (newlines_found == max_lines) {
