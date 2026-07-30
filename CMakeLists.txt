@@ -256,12 +256,7 @@ endif()
 
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE whisper)
 
-# WhisperCPP Models
-set(WHISPER_MODELS
-        "models/ggml-tiny.bin"
-        "models/ggml-base.bin"
-        "models/ggml-small.bin"
-        "models/silero_vad.bin")
 # Install model files
-install(FILES ${WHISPER_MODELS}
-        DESTINATION "${OBS_DATA_DEST}/${OBS_PLUGIN_NAME}/models")
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/models/"
+        DESTINATION "data/obs-plugins/${CMAKE_PROJECT_NAME}/models"
+        OPTIONAL)
