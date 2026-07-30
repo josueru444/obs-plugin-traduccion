@@ -67,6 +67,27 @@ function Package {
     }
     Compress-Archive -Force @CompressArgs
     Log-Group
+
+    Log-Group "Building Installer for ${ProductName}..."
+    $IsccArgs = @(
+        "/dAppName=${ProductName}",
+        "/dAppVersion=${ProductVersion}",
+        "/dSourceDir=${ProjectRoot}\release\${Configuration}",
+        "/dOutputDir=${ProjectRoot}\release",
+        "/dOutputBaseFilename=${OutputName}-installer",
+        "${ScriptHome}\installer.iss"
+    )
+    if (Get-Command "iscc" -ErrorAction SilentlyContinue) {
+        Invoke-External iscc @IsccArgs
+    } else {
+        $IsccPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+        if (Test-Path $IsccPath) {
+            Invoke-External $IsccPath @IsccArgs
+        } else {
+            Write-Warning "Inno Setup (ISCC.exe) not found. Skipping installer creation."
+        }
+    }
+    Log-Group
 }
 
 Package
