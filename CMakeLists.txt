@@ -95,6 +95,7 @@ if(WIN32)
     # Windows obs-deps does not include standalone Opus, build it via FetchContent
     set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
     set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+    set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
     FetchContent_Declare(
         opus
         URL https://github.com/xiph/opus/archive/refs/tags/v1.5.2.tar.gz

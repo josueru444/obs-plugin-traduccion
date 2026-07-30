@@ -58,16 +58,6 @@ function Package {
 
     Remove-Item @RemoveArgs
 
-    Log-Group "Archiving ${ProductName}..."
-    $CompressArgs = @{
-        Path = "${ProjectRoot}/release/${Configuration}/${ProductName}"
-        CompressionLevel = 'Optimal'
-        DestinationPath = "${ProjectRoot}/release/${OutputName}.zip"
-        Verbose = ($Env:CI -ne $null)
-    }
-    Compress-Archive -Force @CompressArgs
-    Log-Group
-
     Log-Group "Building Installer for ${ProductName}..."
     $IsccArgs = @(
         "/dAppName=${ProductName}",
