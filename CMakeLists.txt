@@ -260,7 +260,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE vendor/whisper.cpp/incl
 # Auto-download missing models (tiny, base, small, silero_vad)
 include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/download_models.cmake")
 
-# Install model files
+# Install model files into plugin data folder
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/models/"
-        DESTINATION "data/obs-plugins/${CMAKE_PROJECT_NAME}/models"
+        DESTINATION "${CMAKE_PROJECT_NAME}/data/models"
         OPTIONAL)
