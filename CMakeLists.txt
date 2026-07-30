@@ -157,8 +157,11 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
         # Copy compiled binary
         COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
 
-        # Copy models directory recursively
-        COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/models" "${OBS_PLUGIN_INSTALL_DIR}/data/models"
+        # Copy models directory recursively only if it exists (models are optional in CI)
+        COMMAND ${CMAKE_COMMAND}
+                -DSRC="${CMAKE_CURRENT_SOURCE_DIR}/models"
+                -DDST="${OBS_PLUGIN_INSTALL_DIR}/data/models"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
 
         COMMENT "Install plugin and models into OBS automatically for current system..."
 )
