@@ -202,11 +202,34 @@ if(NOT MSVC)
 endif()
 
 set(WHISPER_ALL_WARNINGS OFF) # Avoid build warnings
+
+# Disable warnings as errors for 3rd party code
+set(SAVE_WARNINGS_AS_ERRORS ${CMAKE_COMPILE_WARNING_AS_ERROR})
+set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
+
 add_subdirectory(vendor/whisper.cpp SYSTEM)
+
+set(CMAKE_COMPILE_WARNING_AS_ERROR ${SAVE_WARNINGS_AS_ERRORS})
+
 # Extra safety patch for GCC/Clang:
 if(NOT MSVC)
     target_compile_options(whisper PRIVATE -Wno-error=format-truncation)
 endif()
+
+# Disable all warnings and warnings-as-errors for whisper.cpp under MSVC
+if(MSVC)
+    target_compile_options(whisper PRIVATE /W0 /WX-)
+    if(TARGET ggml)
+        target_compile_options(ggml PRIVATE /W0 /WX-)
+    endif()
+    if(TARGET ggml-base)
+        target_compile_options(ggml-base PRIVATE /W0 /WX-)
+    endif()
+    if(TARGET ggml-cpu)
+        target_compile_options(ggml-cpu PRIVATE /W0 /WX-)
+    endif()
+endif()
+
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE whisper)
 
 # WhisperCPP Models
