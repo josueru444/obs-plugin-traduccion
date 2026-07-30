@@ -85,11 +85,22 @@ target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE
         _WEBSOCKETPP_CPP11_STL_
 )
 
+# Windows: link Winsock2 required by standalone Asio
+if(WIN32)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE ws2_32 mswsock)
+endif()
+
 # === libopus (audio codec for compressed voice stream to server) ===
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::OPUS)
-message(STATUS "Opus found: ${OPUS_VERSION}")
+if(OS_WINDOWS OR OS_MACOS)
+    # obs-deps prebuilt packages provide Opus via CMake config
+    find_package(Opus REQUIRED)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE Opus::opus)
+else()
+    # Linux: use pkg-config as Opus is typically installed system-wide
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE PkgConfig::OPUS)
+endif()
 
 # === OpenSSL (required for wss:// TLS WebSocket connections) ===
 find_package(OpenSSL REQUIRED)
@@ -150,24 +161,38 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
 #set_target_properties(test_ui PROPERTIES AUTOMOC ON AUTOUIC ON)
 
 # whisper.cpp
-# Force compiler optimizations (Release mode)
-set(CMAKE_BUILD_TYPE Release)
-# Force advanced CPU math optimizations (AVX2/FMA)
+# For single-config generators, default to Release for whisper performance
+if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif()
+
+# CPU math optimizations (safe defaults for x86_64)
 set(GGML_AVX ON CACHE BOOL "" FORCE)
 set(GGML_AVX2 ON CACHE BOOL "" FORCE)
 set(GGML_FMA ON CACHE BOOL "" FORCE)
 set(GGML_F16C ON CACHE BOOL "" FORCE)
 
-# Enable Vulkan GPU acceleration support
-set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+# Vulkan GPU acceleration support (optional, only if SDK is available)
+find_package(Vulkan QUIET)
+if(Vulkan_FOUND)
+    set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+    message(STATUS "Vulkan SDK found — enabling GPU acceleration for whisper.cpp")
+else()
+    set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
+    message(STATUS "Vulkan SDK not found — whisper.cpp will use CPU only")
+endif()
 
-# Disable strict GCC 16 errors to prevent whisper.cpp build failure
-add_compile_options(-Wno-error=enum-conversion -Wno-error=nonnull)
+# Disable strict GCC/Clang errors to prevent whisper.cpp build failure
+if(NOT MSVC)
+    add_compile_options(-Wno-error=enum-conversion -Wno-error=nonnull)
+endif()
 
 set(WHISPER_ALL_WARNINGS OFF) # Avoid build warnings
 add_subdirectory(vendor/whisper.cpp)
-# Extra safety patch for GCC:
-target_compile_options(whisper PRIVATE -Wno-error=format-truncation)
+# Extra safety patch for GCC/Clang:
+if(NOT MSVC)
+    target_compile_options(whisper PRIVATE -Wno-error=format-truncation)
+endif()
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE whisper)
 
 # WhisperCPP Models

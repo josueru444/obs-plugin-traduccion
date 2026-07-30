@@ -1,5 +1,13 @@
 #pragma once
 
+// Windows: include Winsock2 headers before Asio to avoid conflicts
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 // Define macros before including websocketpp/asio
 #ifndef ASIO_STANDALONE
 #define ASIO_STANDALONE
