@@ -26,8 +26,11 @@ DefaultDirName={code:GetOBSPath}
 DefaultGroupName={#AppName}
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseFilename}
-Compression=lzma2/max
+Compression=lzma2/ultra64
 SolidCompression=yes
+LZMAUseSeparateProcess=yes
+LZMADictionarySize=1048576
+LZMANumBlockThreads=6
 DirExistsWarning=no
 DisableProgramGroupPage=yes
 DisableReadyPage=yes
@@ -36,7 +39,7 @@ PrivilegesRequired=admin
 ArchitecturesInstallIn64BitMode=x64
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; Excludes: "*.pdb, *.zip, *.exe"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Code]
 var
