@@ -182,14 +182,18 @@ set(GGML_AVX2 ON CACHE BOOL "" FORCE)
 set(GGML_FMA ON CACHE BOOL "" FORCE)
 set(GGML_F16C ON CACHE BOOL "" FORCE)
 
-# Vulkan GPU acceleration support (optional, only if SDK is available)
-find_package(Vulkan QUIET)
+# Vulkan GPU acceleration support (optional, only if SDK + shader compiler is available)
+find_package(Vulkan QUIET COMPONENTS glslc)
+if(NOT Vulkan_FOUND)
+    find_package(Vulkan QUIET COMPONENTS glslangValidator)
+endif()
+
 if(Vulkan_FOUND)
     set(GGML_VULKAN ON CACHE BOOL "" FORCE)
-    message(STATUS "Vulkan SDK found — enabling GPU acceleration for whisper.cpp")
+    message(STATUS "Vulkan SDK with shader compiler found — enabling GPU acceleration for whisper.cpp")
 else()
     set(GGML_VULKAN OFF CACHE BOOL "" FORCE)
-    message(STATUS "Vulkan SDK not found — whisper.cpp will use CPU only")
+    message(STATUS "Vulkan shader compiler not found — whisper.cpp will use CPU only")
 endif()
 
 # Disable strict GCC/Clang errors to prevent whisper.cpp build failure
