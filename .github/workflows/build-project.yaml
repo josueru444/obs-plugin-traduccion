@@ -298,7 +298,9 @@ jobs:
             Write-Host "=== Found DLL: $dll ==="
             pip install pefile -q
             Set-Content "$env:TEMP\check.py" "import pefile`npe = pefile.PE(r'$dll')`nprint('DLL Dependencies:')`n[print(' ', e.dll.decode()) for e in pe.DIRECTORY_ENTRY_IMPORT]"
-            python "$env:TEMP\check.py"
+            $deps = python "$env:TEMP\check.py"
+            $deps | Write-Host
+            $deps | Out-File -FilePath "$env:GITHUB_WORKSPACE/release/${{ steps.setup.outputs.pluginName }}-${{ steps.setup.outputs.pluginVersion }}-windows-x64-dependencies.txt"
           } else {
             Get-ChildItem -Path "$env:GITHUB_WORKSPACE/release" -Recurse | Select-Object FullName
           }
