@@ -133,7 +133,7 @@ if(WIN32)
         # libcrypto sometimes dynamically depends on zlib1.dll depending on how it was built
         file(GLOB OPENSSL_DLLS "${_ssl_root_dir}/bin/libssl*.dll" "${_ssl_root_dir}/bin/libcrypto*.dll" "${_ssl_root_dir}/bin/zlib*.dll")
         if(OPENSSL_DLLS)
-            install(FILES ${OPENSSL_DLLS} DESTINATION bin/64bit)
+            install(FILES ${OPENSSL_DLLS} DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
         endif()
     endif()
 endif()
