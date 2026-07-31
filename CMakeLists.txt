@@ -120,46 +120,16 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenSSL::SSL OpenSSL::Crypto
 message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
 
 if(WIN32)
-    # FindOpenSSL often creates UNKNOWN targets which breaks IMPORTED_RUNTIME_ARTIFACTS
-    # We manually find the .dlls in the adjacent bin/ directory for local development (POST_BUILD)
-    get_target_property(_ssl_loc OpenSSL::SSL IMPORTED_LOCATION_RELEASE)
-    if(NOT _ssl_loc)
-        get_target_property(_ssl_loc OpenSSL::SSL IMPORTED_LOCATION)
-    endif()
-
-    if(_ssl_loc)
-        get_filename_component(_ssl_lib_dir "${_ssl_loc}" DIRECTORY)
-        get_filename_component(_ssl_root_dir "${_ssl_lib_dir}" DIRECTORY)
+    # Find OpenSSL root directory safely via INCLUDE_DIR instead of IMPORTED_LOCATION
+    # This prevents issues with FindOpenSSL returning NOTFOUND for IMPORTED_LOCATION
+    if(OPENSSL_INCLUDE_DIR)
+        get_filename_component(_ssl_root_dir "${OPENSSL_INCLUDE_DIR}" DIRECTORY)
         # libcrypto sometimes dynamically depends on zlib1.dll depending on how it was built
         file(GLOB OPENSSL_DLLS "${_ssl_root_dir}/bin/libssl*.dll" "${_ssl_root_dir}/bin/libcrypto*.dll" "${_ssl_root_dir}/bin/zlib*.dll")
-    endif()
-
-    # Automatically scan the built plugin for any required DLLs (e.g. OpenSSL, zlib, etc)
-    # and copy them to the installation folder during `cmake --install` so the Inno Setup installer includes them.
-    install(CODE "
-        set(_plugin_dll \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit/${CMAKE_PROJECT_NAME}.dll\")
-        if(EXISTS \"\${_plugin_dll}\")
-            file(GET_RUNTIME_DEPENDENCIES
-                EXECUTABLES \"\${_plugin_dll}\"
-                RESOLVED_DEPENDENCIES_VAR _r_deps
-                UNRESOLVED_DEPENDENCIES_VAR _u_deps
-                DIRECTORIES \"$ENV{GITHUB_WORKSPACE}/obs-deps/bin\" \"$ENV{GITHUB_WORKSPACE}/release/RelWithDebInfo/obs-plugin-traduccion/bin/64bit\"
-            )
-            foreach(_dep IN LISTS _r_deps)
-                string(TOLOWER \"\${_dep}\" _dep_lower)
-                # Ignore Windows system DLLs, OBS Studio core DLLs, and Qt DLLs (OBS ships with Qt)
-                if(NOT _dep_lower MATCHES \"^(c:/windows/.*|.*obs\\\\.dll$|.*qt6.*\\\\.dll$)\")
-                    message(STATUS \"Packaging required DLL: \${_dep}\")
-                    file(INSTALL DESTINATION \"\${CMAKE_INSTALL_PREFIX}/${CMAKE_PROJECT_NAME}/bin/64bit\"
-                         TYPE EXECUTABLE
-                         FILES \"\${_dep}\")
-                endif()
-            endforeach()
-            foreach(_dep IN LISTS _u_deps)
-                message(WARNING \"Unresolved dynamic dependency: \${_dep}\")
-            endforeach()
+        if(OPENSSL_DLLS)
+            install(FILES ${OPENSSL_DLLS} DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
         endif()
-    ")
+    endif()
 endif()
 
 
