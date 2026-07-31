@@ -119,6 +119,13 @@ find_package(OpenSSL REQUIRED)
 target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
 
+if(WIN32)
+    # Install OpenSSL DLLs so they are included in the packaged installer/zip
+    install(IMPORTED_RUNTIME_ARTIFACTS OpenSSL::SSL OpenSSL::Crypto
+            RUNTIME DESTINATION bin/64bit
+            OPTIONAL)
+endif()
+
 
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE src/plugin-main.c)
 
@@ -155,8 +162,9 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/data/models/"
 
-        # Copy compiled binary
-        COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+        # Copy compiled binary and any dynamic dependencies (like OpenSSL DLLs) on Windows
+        $<$<PLATFORM_ID:Windows>:COMMAND;${CMAKE_COMMAND};-E;copy_if_different;"$<TARGET_FILE:${CMAKE_PROJECT_NAME}>";$<TARGET_RUNTIME_DLLS:${CMAKE_PROJECT_NAME}>;"${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/">
+        $<$<NOT:$<PLATFORM_ID:Windows>>:COMMAND;${CMAKE_COMMAND};-E;copy;"$<TARGET_FILE:${CMAKE_PROJECT_NAME}>";"${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/">
 
         # Copy models directory recursively only if it exists (models are optional in CI)
         COMMAND ${CMAKE_COMMAND}
@@ -165,6 +173,7 @@ add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
                 -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
 
         COMMENT "Install plugin and models into OBS automatically for current system..."
+        COMMAND_EXPAND_LISTS
 )
 
 # Create executable for UI testing
