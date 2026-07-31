@@ -120,10 +120,16 @@ target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenSSL::SSL OpenSSL::Crypto
 message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
 
 if(WIN32)
-    # Install OpenSSL DLLs so they are included in the packaged installer/zip
-    install(IMPORTED_RUNTIME_ARTIFACTS OpenSSL::SSL OpenSSL::Crypto
-            RUNTIME DESTINATION bin/64bit
-            OPTIONAL)
+    # FindOpenSSL often creates UNKNOWN targets which breaks IMPORTED_RUNTIME_ARTIFACTS
+    # We manually find the .dlls in the adjacent bin/ directory
+    if(OPENSSL_SSL_LIBRARY)
+        get_filename_component(_ssl_lib_dir "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+        get_filename_component(_ssl_root_dir "${_ssl_lib_dir}" DIRECTORY)
+        file(GLOB OPENSSL_DLLS "${_ssl_root_dir}/bin/libssl*.dll" "${_ssl_root_dir}/bin/libcrypto*.dll")
+        if(OPENSSL_DLLS)
+            install(FILES ${OPENSSL_DLLS} DESTINATION bin/64bit)
+        endif()
+    endif()
 endif()
 
 
@@ -163,8 +169,8 @@ if(WIN32)
             COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
             COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/data/models/"
 
-            # Copy compiled binary and any dynamic dependencies (like OpenSSL DLLs) on Windows
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" $<TARGET_RUNTIME_DLLS:${CMAKE_PROJECT_NAME}> "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+            # Copy compiled binary
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
 
             # Copy models directory recursively only if it exists (models are optional in CI)
             COMMAND ${CMAKE_COMMAND}
@@ -173,8 +179,12 @@ if(WIN32)
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
 
             COMMENT "Install plugin and models into OBS automatically for current system..."
-            COMMAND_EXPAND_LISTS
     )
+    if(OPENSSL_DLLS)
+        add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENSSL_DLLS} "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+        )
+    endif()
 else()
     add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
             # Create directories safely across platforms
