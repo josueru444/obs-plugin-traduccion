@@ -157,24 +157,42 @@ else()
 endif()
 
 # Automate plugin copy to OBS on post-build
-add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-        # Create directories safely across platforms
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/data/models/"
+if(WIN32)
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+            # Create directories safely across platforms
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/data/models/"
 
-        # Copy compiled binary and any dynamic dependencies (like OpenSSL DLLs) on Windows
-        $<$<PLATFORM_ID:Windows>:COMMAND;${CMAKE_COMMAND};-E;copy_if_different;"$<TARGET_FILE:${CMAKE_PROJECT_NAME}>";$<TARGET_RUNTIME_DLLS:${CMAKE_PROJECT_NAME}>;"${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/">
-        $<$<NOT:$<PLATFORM_ID:Windows>>:COMMAND;${CMAKE_COMMAND};-E;copy;"$<TARGET_FILE:${CMAKE_PROJECT_NAME}>";"${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/">
+            # Copy compiled binary and any dynamic dependencies (like OpenSSL DLLs) on Windows
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" $<TARGET_RUNTIME_DLLS:${CMAKE_PROJECT_NAME}> "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
 
-        # Copy models directory recursively only if it exists (models are optional in CI)
-        COMMAND ${CMAKE_COMMAND}
-                -DSRC="${CMAKE_CURRENT_SOURCE_DIR}/models"
-                -DDST="${OBS_PLUGIN_INSTALL_DIR}/data/models"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
+            # Copy models directory recursively only if it exists (models are optional in CI)
+            COMMAND ${CMAKE_COMMAND}
+                    -DSRC="${CMAKE_CURRENT_SOURCE_DIR}/models"
+                    -DDST="${OBS_PLUGIN_INSTALL_DIR}/data/models"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
 
-        COMMENT "Install plugin and models into OBS automatically for current system..."
-        COMMAND_EXPAND_LISTS
-)
+            COMMENT "Install plugin and models into OBS automatically for current system..."
+            COMMAND_EXPAND_LISTS
+    )
+else()
+    add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
+            # Create directories safely across platforms
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/data/models/"
+
+            # Copy compiled binary
+            COMMAND ${CMAKE_COMMAND} -E copy "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+
+            # Copy models directory recursively only if it exists (models are optional in CI)
+            COMMAND ${CMAKE_COMMAND}
+                    -DSRC="${CMAKE_CURRENT_SOURCE_DIR}/models"
+                    -DDST="${OBS_PLUGIN_INSTALL_DIR}/data/models"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
+
+            COMMENT "Install plugin and models into OBS automatically for current system..."
+    )
+endif()
 
 # Create executable for UI testing
 #add_executable(test_ui test_ui.cpp ui/setup.cpp ui/setup.h ui/setup.ui
