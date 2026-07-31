@@ -293,14 +293,20 @@ jobs:
       - name: Diagnose DLL Dependencies 🔍
         shell: pwsh
         run: |
-          # Find the compiled plugin DLL and list all its dependencies
           $dllPath = Get-ChildItem -Path "$env:GITHUB_WORKSPACE/release" -Recurse -Filter "obs-plugin-traduccion.dll" | Select-Object -First 1
           if ($dllPath) {
             Write-Host "=== Found DLL: $($dllPath.FullName) ==="
-            Write-Host "=== Direct dependencies (dumpbin): ==="
-            & "dumpbin" /dependents "$($dllPath.FullName)"
+            # Use Python pefile to extract imports (no VS env needed)
+            pip install pefile -q
+            python -c "
+import pefile
+pe = pefile.PE(r'$($dllPath.FullName)')
+print('=== DLL Dependencies ===')
+for entry in pe.DIRECTORY_ENTRY_IMPORT:
+    print(' ', entry.dll.decode())
+"
           } else {
-            Write-Host "DLL not found in release folder!"
+            Write-Host "DLL not found! Contents of release:"
             Get-ChildItem -Path "$env:GITHUB_WORKSPACE/release" -Recurse | Select-Object FullName
           }
 
