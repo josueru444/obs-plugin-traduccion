@@ -135,6 +135,32 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 		ctx->set_verify_mode(asio::ssl::verify_none);
 		return ctx;
 	});
+
+	m_client_tls->set_socket_init_handler([this](websocketpp::connection_hdl hdl, asio::ssl::stream<asio::ip::tcp::socket>& ssl_stream) {
+		websocketpp::lib::error_code ec;
+		auto con = m_client_tls->get_con_from_hdl(hdl, ec);
+		if (!ec && con) {
+			auto uri = con->get_uri();
+			if (uri) {
+				std::string sni_host = uri->get_host();
+				size_t colon_pos = sni_host.find(':');
+				if (colon_pos != std::string::npos) {
+					sni_host = sni_host.substr(0, colon_pos);
+				}
+				bool is_ip = !sni_host.empty();
+				for (char c : sni_host) {
+					if (!std::isdigit(c) && c != '.' && c != ':') {
+						is_ip = false;
+						break;
+					}
+				}
+				if (!is_ip && !sni_host.empty()) {
+					SSL_set_tlsext_host_name(ssl_stream.native_handle(), sni_host.c_str());
+				}
+			}
+		}
+	});
+
 	m_client_tls->clear_access_channels(websocketpp::log::alevel::all);
 	m_client_tls->clear_error_channels(websocketpp::log::elevel::all);
 	m_client_tls->set_open_handler(open_handler);
@@ -287,32 +313,15 @@ void RemoteTranscriber::connect()
 
 		// Skip ngrok free-tier browser interstitial page
 		con->append_header("ngrok-skip-browser-warning", "true");
+        con->replace_header("User-Agent", "OBS-Plugin-Traduccion/1.0");
 
-		// Set OpenSSL SNI (Server Name Indication) for Cloudflare / LitNG / reverse proxies
-		// SNI must NOT contain port number and must NOT be an IP address
-		auto uri = con->get_uri();
-		if (uri) {
-			std::string sni_host = uri->get_host();
-			size_t colon_pos = sni_host.find(':');
-			if (colon_pos != std::string::npos) {
-				sni_host = sni_host.substr(0, colon_pos);
-			}
-
-			bool is_ip = !sni_host.empty();
-			for (char c : sni_host) {
-				if (!std::isdigit(c) && c != '.' && c != ':') {
-					is_ip = false;
-					break;
-				}
-			}
-
-			if (!is_ip && !sni_host.empty()) {
-				SSL *ssl = con->get_socket().native_handle();
-				if (ssl) {
-					SSL_set_tlsext_host_name(ssl, sni_host.c_str());
-				}
-			}
-		}
+        // Set Origin to avoid 400 Bad Request on strict servers/proxies
+        if (auto uri = con->get_uri()) {
+            std::string sni_host = uri->get_host();
+            size_t colon = sni_host.find(':');
+            if (colon != std::string::npos) sni_host = sni_host.substr(0, colon);
+            con->append_header("Origin", "https://" + sni_host);
+        }
 
 		m_hdl = con->get_handle();
 		m_client_tls->connect(con);
@@ -327,6 +336,16 @@ void RemoteTranscriber::connect()
 			schedule_reconnect();
 			return;
 		}
+
+		con->append_header("ngrok-skip-browser-warning", "true");
+        con->replace_header("User-Agent", "OBS-Plugin-Traduccion/1.0");
+        if (auto uri = con->get_uri()) {
+            std::string sni_host = uri->get_host();
+            size_t colon = sni_host.find(':');
+            if (colon != std::string::npos) sni_host = sni_host.substr(0, colon);
+            con->append_header("Origin", "http://" + sni_host);
+        }
+
 		m_hdl = con->get_handle();
 		m_client_plain->connect(con);
 	}
