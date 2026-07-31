@@ -215,6 +215,9 @@ set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS OFF CACHE BOOL "Export all symbols" FORCE)
 # Ensure position-independent code (-fPIC) for static libs linked into shared module (.so)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Disable OpenMP to prevent dynamic dependency on vcomp140.dll on Windows (causes Error 126)
+set(GGML_OPENMP OFF CACHE BOOL "Disable OpenMP" FORCE)
+
 # Disable warnings as errors for 3rd party code
 set(SAVE_WARNINGS_AS_ERRORS ${CMAKE_COMPILE_WARNING_AS_ERROR})
 set(CMAKE_COMPILE_WARNING_AS_ERROR OFF)
