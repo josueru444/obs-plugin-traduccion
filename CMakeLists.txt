@@ -122,10 +122,16 @@ message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
 if(WIN32)
     # FindOpenSSL often creates UNKNOWN targets which breaks IMPORTED_RUNTIME_ARTIFACTS
     # We manually find the .dlls in the adjacent bin/ directory
-    if(OPENSSL_SSL_LIBRARY)
-        get_filename_component(_ssl_lib_dir "${OPENSSL_SSL_LIBRARY}" DIRECTORY)
+    get_target_property(_ssl_loc OpenSSL::SSL IMPORTED_LOCATION_RELEASE)
+    if(NOT _ssl_loc)
+        get_target_property(_ssl_loc OpenSSL::SSL IMPORTED_LOCATION)
+    endif()
+
+    if(_ssl_loc)
+        get_filename_component(_ssl_lib_dir "${_ssl_loc}" DIRECTORY)
         get_filename_component(_ssl_root_dir "${_ssl_lib_dir}" DIRECTORY)
-        file(GLOB OPENSSL_DLLS "${_ssl_root_dir}/bin/libssl*.dll" "${_ssl_root_dir}/bin/libcrypto*.dll")
+        # libcrypto sometimes dynamically depends on zlib1.dll depending on how it was built
+        file(GLOB OPENSSL_DLLS "${_ssl_root_dir}/bin/libssl*.dll" "${_ssl_root_dir}/bin/libcrypto*.dll" "${_ssl_root_dir}/bin/zlib*.dll")
         if(OPENSSL_DLLS)
             install(FILES ${OPENSSL_DLLS} DESTINATION bin/64bit)
         endif()
@@ -183,6 +189,7 @@ if(WIN32)
     if(OPENSSL_DLLS)
         add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
             COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENSSL_DLLS} "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+            COMMAND_EXPAND_LISTS
         )
     endif()
 else()
