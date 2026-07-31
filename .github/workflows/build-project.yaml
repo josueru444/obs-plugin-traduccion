@@ -293,20 +293,13 @@ jobs:
       - name: Diagnose DLL Dependencies 🔍
         shell: pwsh
         run: |
-          $dllPath = Get-ChildItem -Path "$env:GITHUB_WORKSPACE/release" -Recurse -Filter "obs-plugin-traduccion.dll" | Select-Object -First 1
-          if ($dllPath) {
-            Write-Host "=== Found DLL: $($dllPath.FullName) ==="
+          $dll = (Get-ChildItem -Path "$env:GITHUB_WORKSPACE/release" -Recurse -Filter "obs-plugin-traduccion.dll" | Select-Object -First 1).FullName
+          if ($dll) {
+            Write-Host "=== Found DLL: $dll ==="
             pip install pefile -q
-            $script = @"
-import pefile
-pe = pefile.PE(r'$($dllPath.FullName)')
-print('=== DLL Dependencies ===')
-for entry in pe.DIRECTORY_ENTRY_IMPORT:
-    print(' ', entry.dll.decode())
-"@
-            $script | python
+            Set-Content "$env:TEMP\check.py" "import pefile`npe = pefile.PE(r'$dll')`nprint('DLL Dependencies:')`n[print(' ', e.dll.decode()) for e in pe.DIRECTORY_ENTRY_IMPORT]"
+            python "$env:TEMP\check.py"
           } else {
-            Write-Host "DLL not found! Contents of release:"
             Get-ChildItem -Path "$env:GITHUB_WORKSPACE/release" -Recurse | Select-Object FullName
           }
 
