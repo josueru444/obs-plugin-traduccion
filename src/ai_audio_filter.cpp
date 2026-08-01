@@ -47,7 +47,7 @@ struct VadState {
 };
 
 struct AudioSegment {
-	std::vector<float> audio;
+	std::vector<float>* audio;
 	bool is_final;
 	size_t sentence_id;
 };
@@ -80,6 +80,9 @@ struct ai_filter_data {
 	std::thread worker_thread;
 	std::atomic<bool> stop_worker;
 
+	std::vector<std::vector<float>*> buffer_pool;
+	std::mutex pool_mutex;
+
 	audio_resampler_t *resampler;
 	uint32_t resampler_src_rate;
 
@@ -100,8 +103,6 @@ struct ai_filter_data {
 	obs_weak_source_t *subtitle_weak_ref{nullptr};
 	std::chrono::steady_clock::time_point last_subtitle_time;
 	std::atomic<bool> subtitle_visible{false};
-	std::thread clear_timer_thread;
-	std::atomic<bool> stop_clear_timer{false};
 	int auto_clear_seconds{5};
 };
 
@@ -223,6 +224,20 @@ static std::string sanitize_text(const std::string &text)
 
 	if (result.length() <= 2)
 		return "";
+
+	std::string lower_res;
+	for (char c : result) {
+		lower_res += std::tolower(static_cast<unsigned char>(c));
+	}
+	if (lower_res.find("thanks for watching") != std::string::npos ||
+	    lower_res.find("subtitles by") != std::string::npos ||
+	    lower_res.find("subtitled by") != std::string::npos ||
+	    lower_res.find("amara.org") != std::string::npos ||
+	    lower_res.find("subscribe") != std::string::npos ||
+	    lower_res.find("suscríbete") != std::string::npos) {
+		return "";
+	}
+
 	if (is_repetitive(result))
 		return "";
 
@@ -259,6 +274,9 @@ static void update_subtitle_source(ai_filter_data *data, const std::string &text
 				// Evict oldest entry when ring buffer is full.
 				while (data->confirmed_lines.size() > MAX_CONFIRMED_LINES)
 					data->confirmed_lines.pop_front();
+			} else {
+				// Empty final text implies a clear command
+				data->confirmed_lines.clear();
 			}
 			data->current_partial.clear();
 		} else {
@@ -325,22 +343,7 @@ static void update_subtitle_source(ai_filter_data *data, const std::string &text
 	}
 }
 
-static void subtitle_clear_worker(ai_filter_data *data)
-{
-	while (!data->stop_clear_timer.load()) {
-		std::this_thread::sleep_for(std::chrono::milliseconds(500));
-		
-		if (data->subtitle_visible.load() && data->auto_clear_seconds > 0) {
-			auto now = std::chrono::steady_clock::now();
-			auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - data->last_subtitle_time).count();
-			
-			if (duration >= data->auto_clear_seconds) {
-				data->subtitle_visible.store(false);
-				update_subtitle_source(data, "", true);
-			}
-		}
-	}
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // transcription_worker
@@ -357,9 +360,22 @@ static void transcription_worker(ai_filter_data *data)
 		AudioSegment segment;
 		{
 			std::unique_lock<std::mutex> lock(data->queue_mutex);
-			data->cv.wait(lock, [data] {
+			bool signaled = data->cv.wait_for(lock, std::chrono::milliseconds(500), [data] {
 				return !data->segment_queue.empty() || data->stop_worker.load();
 			});
+
+			if (!signaled) {
+				if (data->subtitle_visible.load() && data->auto_clear_seconds > 0) {
+					auto now = std::chrono::steady_clock::now();
+					auto duration = std::chrono::duration_cast<std::chrono::seconds>(now - data->last_subtitle_time).count();
+					
+					if (duration >= data->auto_clear_seconds) {
+						data->subtitle_visible.store(false);
+						update_subtitle_source(data, "", true);
+					}
+				}
+				continue;
+			}
 
 			if (data->stop_worker.load() && data->segment_queue.empty())
 				break;
@@ -371,6 +387,10 @@ static void transcription_worker(ai_filter_data *data)
 			while (!segment.is_final && !data->segment_queue.empty()) {
 				AudioSegment &next = data->segment_queue.front();
 				if (!next.is_final && next.sentence_id == segment.sentence_id) {
+					if (segment.audio) {
+						std::lock_guard<std::mutex> pool_lock(data->pool_mutex);
+						data->buffer_pool.push_back(segment.audio);
+					}
 					segment = next;
 					data->segment_queue.pop();
 				} else {
@@ -379,8 +399,13 @@ static void transcription_worker(ai_filter_data *data)
 			}
 		}
 
-		if (segment.audio.empty())
+		if (!segment.audio || segment.audio->empty()) {
+			if (segment.audio) {
+				std::lock_guard<std::mutex> pool_lock(data->pool_mutex);
+				data->buffer_pool.push_back(segment.audio);
+			}
 			continue;
+		}
 
 		if (data->use_remote_transcription && data->remote_client) {
 			// ── Remote mode ───────────────────────────────────────────────────
@@ -392,22 +417,29 @@ static void transcription_worker(ai_filter_data *data)
 			blog(LOG_DEBUG,
 			     "[AI Translator] -> Remote: send segment %zu (%s, %zu samples)",
 			     segment.sentence_id, segment.is_final ? "FINAL" : "PARTIAL",
-			     segment.audio.size());
-			data->remote_client->send_audio(segment.audio, segment.sentence_id,
+			     segment.audio->size());
+			data->remote_client->send_audio(*segment.audio, segment.sentence_id,
 			                                segment.is_final);
 
 		} else if (data->processor) {
 			// ── Local mode (Whisper) ──────────────────────────────────────────
 			std::string raw_texto = data->processor->process_audio(
-				segment.audio, data->current_language, data->local_translation, "",
+				*segment.audio, data->current_language, data->local_translation, "",
 				data->whisper_threads);
 			std::string texto = sanitize_text(raw_texto);
 
+
+
 			if (!texto.empty()) {
-				blog(LOG_INFO, "[AI Translator] Local transcription (%s): %s",
-				     segment.is_final ? "FINAL" : "PARTIAL", texto.c_str());
 				update_subtitle_source(data, texto, segment.is_final);
 			}
+		}
+
+		// Return buffer to pool
+		if (segment.audio) {
+			segment.audio->clear();
+			std::lock_guard<std::mutex> pool_lock(data->pool_mutex);
+			data->buffer_pool.push_back(segment.audio);
 		}
 	}
 }
@@ -472,15 +504,7 @@ static bool on_remote_transcription_toggled(obs_properties_t *props, obs_propert
 	return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Filter defaults
-// ─────────────────────────────────────────────────────────────────────────────
-static void ai_filter_get_defaults(obs_data_t *settings)
-{
-	obs_data_set_default_string(settings, "model_settings", "ggml-base.bin");
-	obs_data_set_default_int(settings, "whisper_threads", 4);
-	obs_data_set_default_string(settings, "lang_in", "auto");
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Filter properties (UI)
@@ -700,8 +724,6 @@ static void ai_filter_update(void *data, obs_data_t *settings)
 		auto result_cb = [fd](const TranscriptionResult &r) {
 			std::string texto = sanitize_text(r.text);
 			if (!texto.empty()) {
-				blog(LOG_INFO, "[AI Translator] <- Remote (%s): %s",
-				     r.is_final ? "FINAL" : "PARTIAL", texto.c_str());
 				update_subtitle_source(fd, texto, r.is_final);
 			}
 		};
@@ -739,9 +761,7 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 	// Read initial settings into data struct
 	ai_filter_update(data, settings);
 	
-	// Start clear timer thread
-	data->stop_clear_timer.store(false);
-	data->clear_timer_thread = std::thread(subtitle_clear_worker, data);
+	// Clear timer logic is now in transcription_worker
 
 	// Create appropriate backend based on initial configuration
 	std::string full_url = build_full_ws_url(data->ws_url, data->ws_token, data->current_language, data->target_language);
@@ -778,8 +798,12 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 		data->vad_ctx = nullptr;
 	}
 
+	data->vad.speech_frames.reserve(16000 * 30);
+	data->vad.preroll.reserve(16000);
+	data->vad.overlap_buffer.reserve(16000);
+
 	// Overwrite any hallucinated text saved in OBS scene collection from previous sessions
-	update_subtitle_source(data, "Traductor IA: Listo", true);
+	update_subtitle_source(data, "", true);
 
 	return data;
 }
@@ -803,10 +827,7 @@ static void ai_filter_destroy(void *data)
 	fd->cv.notify_all();
 	if (fd->worker_thread.joinable())
 		fd->worker_thread.join();
-		
-	fd->stop_clear_timer.store(true);
-	if (fd->clear_timer_thread.joinable())
-		fd->clear_timer_thread.join();
+
 		
 	if (fd->subtitle_weak_ref) {
 		obs_weak_source_release(fd->subtitle_weak_ref);
@@ -818,6 +839,24 @@ static void ai_filter_destroy(void *data)
 	if (fd->remote_client) {
 		delete fd->remote_client;
 		fd->remote_client = nullptr;
+	}
+
+	// Clean up segment queue and buffer pool
+	{
+		std::lock_guard<std::mutex> lock(fd->queue_mutex);
+		while (!fd->segment_queue.empty()) {
+			if (fd->segment_queue.front().audio) {
+				delete fd->segment_queue.front().audio;
+			}
+			fd->segment_queue.pop();
+		}
+	}
+	{
+		std::lock_guard<std::mutex> lock(fd->pool_mutex);
+		for (auto* buf : fd->buffer_pool) {
+			delete buf;
+		}
+		fd->buffer_pool.clear();
 	}
 
 	// 3. Destroy Whisper processor
@@ -841,7 +880,7 @@ static void ai_filter_destroy(void *data)
 // ─────────────────────────────────────────────────────────────────────────────
 // Default settings
 // ─────────────────────────────────────────────────────────────────────────────
-static void aI_filter_get_default(obs_data_t *settings)
+static void ai_filter_get_defaults(obs_data_t *settings)
 {
 	obs_data_set_default_string(settings, "lang_in", "es");
 	obs_data_set_default_string(settings, "lang_out", "en");
@@ -859,13 +898,30 @@ static void aI_filter_get_default(obs_data_t *settings)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// get_audio_buffer — Fetch a buffer from the pool or create a new one
+// ─────────────────────────────────────────────────────────────────────────────
+static std::vector<float>* get_audio_buffer(ai_filter_data *data)
+{
+	std::lock_guard<std::mutex> lock(data->pool_mutex);
+	if (!data->buffer_pool.empty()) {
+		auto* buf = data->buffer_pool.back();
+		data->buffer_pool.pop_back();
+		return buf;
+	}
+	auto* buf = new std::vector<float>();
+	buf->reserve(16000 * 30);
+	return buf;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // _flush_segment — Finalize active speech segment and enqueue
 // ─────────────────────────────────────────────────────────────────────────────
 static void _flush_segment(ai_filter_data *filter_data)
 {
 	if (filter_data->vad.speech_ms >= MIN_SPEECH_MS) {
 		AudioSegment seg;
-		seg.audio = filter_data->vad.speech_frames;
+		seg.audio = get_audio_buffer(filter_data);
+		*seg.audio = filter_data->vad.speech_frames;
 		seg.is_final = true;
 		seg.sentence_id = filter_data->vad.sentence_id;
 
@@ -1003,7 +1059,8 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 					    1000) {
 						filter_data->vad.last_partial_ms = filter_data->vad.speech_ms;
 						AudioSegment seg;
-						seg.audio = filter_data->vad.speech_frames;
+						seg.audio = get_audio_buffer(filter_data);
+						*seg.audio = filter_data->vad.speech_frames;
 						seg.is_final = false;
 						seg.sentence_id = filter_data->vad.sentence_id;
 						{
@@ -1038,7 +1095,8 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 							filter_data->vad.last_partial_ms =
 								filter_data->vad.speech_ms;
 							AudioSegment seg;
-							seg.audio = filter_data->vad.speech_frames;
+							seg.audio = get_audio_buffer(filter_data);
+							*seg.audio = filter_data->vad.speech_frames;
 							seg.is_final = false;
 							seg.sentence_id = filter_data->vad.sentence_id;
 							{
@@ -1073,7 +1131,7 @@ extern "C" struct obs_source_info get_ai_filter_info()
 	info.type = OBS_SOURCE_TYPE_FILTER;
 	info.output_flags = OBS_SOURCE_AUDIO;
 	info.get_name = ai_filter_get_name;
-	info.get_defaults = aI_filter_get_default;
+	info.get_defaults = ai_filter_get_defaults;
 	info.update = ai_filter_update;
 	info.create = ai_filter_create;
 	info.destroy = ai_filter_destroy;

@@ -27,6 +27,15 @@ struct MyCaptionsFont {
 	obs_source_t *text_font;
 	obs_source_t *color_font;
 	long cached_bg_color;
+	
+	std::string cached_text;
+	long cached_text_color;
+	bool cached_outline;
+	long cached_outline_color;
+	bool cached_drop_shadow;
+	std::string cached_font_face;
+	int cached_font_size;
+	std::string cached_font_style;
 };
 
 // Count UTF-8 characters properly
@@ -43,8 +52,22 @@ static size_t utf8_char_count(const std::string &s)
 // Estimate text width for word wrapping
 static float estimate_text_width(const std::string &text, int font_size)
 {
-	const float avg_char_width_ratio = 0.55f;
-	return (float)utf8_char_count(text) * (float)font_size * avg_char_width_ratio;
+	float width = 0.0f;
+	for (char c : text) {
+		if ((c & 0xC0) != 0x80) {
+			unsigned char uc = (unsigned char)c;
+			if (uc <= 127) {
+				width += (float)font_size * 0.55f;
+			} else if ((uc & 0xE0) == 0xC0) {
+				// 2 bytes: Latin extended, Cyrillic, Greek, etc.
+				width += (float)font_size * 0.55f;
+			} else {
+				// 3 or 4 bytes: CJK, Emoji, etc.
+				width += (float)font_size * 1.0f;
+			}
+		}
+	}
+	return width;
 }
 
 // Wrap text by words
@@ -101,7 +124,7 @@ static std::string wrap_text_by_words(const std::string &input, int max_width_px
 				if ((c & 0xC0) != 0x80) {
 					if (estimate_text_width(current_chunk, font_size) > (float)max_width_px && !last_valid_chunk.empty()) {
 						result += last_valid_chunk + "\n";
-						current_chunk = current_chunk.substr(last_valid_chunk.length());
+						current_chunk = std::string(1, c);
 					}
 					last_valid_chunk = current_chunk;
 				}
@@ -128,11 +151,11 @@ static void *my_font_create(obs_data_t *settings, obs_source_t *source)
 	(void)source;
 	(void)settings;
 
-	MyCaptionsFont *data = (MyCaptionsFont *)malloc(sizeof(MyCaptionsFont));
+	MyCaptionsFont *data = new MyCaptionsFont();
 	data->cached_bg_color = -1;
 
 	obs_data_t *text_defaults = obs_data_create();
-	obs_data_set_string(text_defaults, "text", "Subtítulos IA (Esperando...)");
+	obs_data_set_string(text_defaults, "text", "");
 	apply_text_color(text_defaults, 0xFFFFFFFF);
 
 	obs_data_t *font_obj = obs_data_create();
@@ -162,7 +185,7 @@ static void my_font_destroy(void *data)
 	MyCaptionsFont *font_data = (MyCaptionsFont *)data;
 	obs_source_release(font_data->text_font);
 	obs_source_release(font_data->color_font);
-	free(font_data);
+	delete font_data;
 }
 
 // Render subtitle source
@@ -277,14 +300,11 @@ static void my_font_get_defaults(obs_data_t *settings)
 static void my_font_update(void *data, obs_data_t *settings)
 {
 	MyCaptionsFont *ctx = (MyCaptionsFont *)data;
-
-	obs_data_t *text_settings = obs_data_create();
-	long text_color = (long)obs_data_get_int(settings, "text_color");
-	apply_text_color(text_settings, text_color);
 	
-	obs_data_set_bool(text_settings, "outline", obs_data_get_bool(settings, "outline"));
-	obs_data_set_int(text_settings, "outline_color", obs_data_get_int(settings, "outline_color"));
-	obs_data_set_bool(text_settings, "drop_shadow", obs_data_get_bool(settings, "drop_shadow"));
+	long text_color = (long)obs_data_get_int(settings, "text_color");
+	bool outline = obs_data_get_bool(settings, "outline");
+	long outline_color = (long)obs_data_get_int(settings, "outline_color");
+	bool drop_shadow = obs_data_get_bool(settings, "drop_shadow");
 
 	bool word_wrap = obs_data_get_bool(settings, "word_wrap");
 	long custom_width = (long)obs_data_get_int(settings, "custom_width");
@@ -296,20 +316,17 @@ static void my_font_update(void *data, obs_data_t *settings)
 	}
 
 	int font_size = 45;
+	std::string font_face = "Arial";
+	std::string font_style = "Regular";
 
 	if (font_obj) {
 		font_size = (int)obs_data_get_int(font_obj, "size");
-		if (font_size <= 0)
-			font_size = 45;
-		obs_data_set_obj(text_settings, "font", font_obj);
+		if (font_size <= 0) font_size = 45;
+		const char *face = obs_data_get_string(font_obj, "face");
+		const char *style = obs_data_get_string(font_obj, "style");
+		if (face) font_face = face;
+		if (style) font_style = style;
 		obs_data_release(font_obj);
-	} else {
-		obs_data_t *fallback_font = obs_data_create();
-		obs_data_set_string(fallback_font, "face", "Arial");
-		obs_data_set_string(fallback_font, "style", "Regular");
-		obs_data_set_int(fallback_font, "size", 45);
-		obs_data_set_obj(text_settings, "font", fallback_font);
-		obs_data_release(fallback_font);
 	}
 
 	const char *new_text = obs_data_get_string(settings, "text");
@@ -332,9 +349,45 @@ static void my_font_update(void *data, obs_data_t *settings)
 		}
 	}
 
-	obs_data_set_string(text_settings, "text", text_to_set.c_str());
-	obs_source_update(ctx->text_font, text_settings);
-	obs_data_release(text_settings);
+	bool text_changed = (ctx->cached_text != text_to_set);
+	bool appearance_changed = (ctx->cached_text_color != text_color ||
+	                           ctx->cached_outline != outline ||
+	                           ctx->cached_outline_color != outline_color ||
+	                           ctx->cached_drop_shadow != drop_shadow ||
+	                           ctx->cached_font_face != font_face ||
+	                           ctx->cached_font_size != font_size ||
+	                           ctx->cached_font_style != font_style);
+
+	if (text_changed || appearance_changed) {
+		obs_data_t *text_settings = obs_data_create();
+		obs_data_set_string(text_settings, "text", text_to_set.c_str());
+
+		if (appearance_changed) {
+			apply_text_color(text_settings, text_color);
+			obs_data_set_bool(text_settings, "outline", outline);
+			obs_data_set_int(text_settings, "outline_color", outline_color);
+			obs_data_set_bool(text_settings, "drop_shadow", drop_shadow);
+
+			obs_data_t *new_font_obj = obs_data_create();
+			obs_data_set_string(new_font_obj, "face", font_face.c_str());
+			obs_data_set_string(new_font_obj, "style", font_style.c_str());
+			obs_data_set_int(new_font_obj, "size", font_size);
+			obs_data_set_obj(text_settings, "font", new_font_obj);
+			obs_data_release(new_font_obj);
+
+			ctx->cached_text_color = text_color;
+			ctx->cached_outline = outline;
+			ctx->cached_outline_color = outline_color;
+			ctx->cached_drop_shadow = drop_shadow;
+			ctx->cached_font_face = font_face;
+			ctx->cached_font_size = font_size;
+			ctx->cached_font_style = font_style;
+		}
+
+		obs_source_update(ctx->text_font, text_settings);
+		obs_data_release(text_settings);
+		ctx->cached_text = text_to_set;
+	}
 
 	long bg_color = (long)obs_data_get_int(settings, "bg_color");
 	if (bg_color != ctx->cached_bg_color) {

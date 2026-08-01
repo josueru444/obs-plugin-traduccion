@@ -10,9 +10,9 @@ audio_processor::audio_processor(const std::string &model_path)
 	ctx = whisper_init_from_file_with_params(model_path.c_str(), cparams);
 
 	if (ctx == nullptr) {
-		std::cerr << "Error loading whisper model" << std::endl;
+		blog(LOG_ERROR, "[AI Translator] Error loading whisper model: %s", model_path.c_str());
 	} else {
-		std::cout << "Whisper model loaded successfully" << std::endl;
+		blog(LOG_INFO, "[AI Translator] Whisper model loaded successfully: %s", model_path.c_str());
 	}
 }
 

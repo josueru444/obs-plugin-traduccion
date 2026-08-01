@@ -80,12 +80,9 @@ asio::io_service &RemoteTranscriber::get_io_service()
 // ─────────────────────────────────────────────────────────────────────────────
 void RemoteTranscriber::process_message(const std::string &payload)
 {
-	auto result = parse_json_response(payload);
-
-	if (!result.text.empty() && m_callback) {
-		blog(LOG_INFO, "[RemoteTranscriber] Received response (id=%zu, %s): %s",
-		     result.sentence_id, result.is_final ? "FINAL" : "PARTIAL", result.text.c_str());
-		m_callback(result);
+	TranscriptionResult res = parse_json_response(payload);
+	if (m_callback) {
+		m_callback(res);
 	}
 }
 
@@ -95,7 +92,8 @@ void RemoteTranscriber::process_message(const std::string &payload)
 RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_result, StatusCallback on_status)
 	: m_url(url), m_callback(std::move(on_result)), m_status_cb(std::move(on_status)),
 	  m_use_tls(url.size() >= 6 && url.substr(0, 6) == "wss://"),
-	  m_work_guard(asio::make_work_guard(m_io_service))
+	  m_work_guard(asio::make_work_guard(m_io_service)),
+	  m_alive(std::make_shared<bool>(true))
 {
 	blog(LOG_INFO, "[RemoteTranscriber] Protocol: %s", m_use_tls ? "wss (TLS)" : "ws (plain)");
 
@@ -207,6 +205,10 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 // ─────────────────────────────────────────────────────────────────────────────
 RemoteTranscriber::~RemoteTranscriber()
 {
+	if (m_alive) {
+		*m_alive = false;
+	}
+
 	// Signal stop reconnect attempts
 	m_running.store(false);
 	m_connected.store(false);
@@ -364,7 +366,8 @@ void RemoteTranscriber::schedule_reconnect()
 	// Use steady_timer to avoid blocking io_context for 3 seconds
 	auto timer = std::make_shared<asio::steady_timer>(get_io_service(),
 	                                                   std::chrono::seconds(3));
-	timer->async_wait([this, timer](const asio::error_code &ec) {
+	timer->async_wait([this, timer, alive = m_alive](const asio::error_code &ec) {
+		if (!*alive) return;
 		if (!ec && m_running.load() && !m_url.empty()) {
 			blog(LOG_INFO, "[RemoteTranscriber] Retrying connection to %s ...", m_url.c_str());
 			connect();
@@ -447,9 +450,6 @@ void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentence_id, bool is_final)
 {
 	if (!m_connected.load()) {
-		blog(LOG_DEBUG,
-		     "[RemoteTranscriber] send_audio: no connection, drop segment %zu",
-		     sentence_id);
 		return;
 	}
 	if (!m_encoder) {
@@ -458,6 +458,9 @@ void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentenc
 	}
 	if (pcm.empty())
 		return;
+
+	// Reset Opus encoder state since we are encoding a full audio segment from the start
+	opus_encoder_ctl(m_encoder, OPUS_RESET_STATE);
 
 	// ── Build binary message ──────────────────────────────────────────────────
 	std::vector<uint8_t> message;
@@ -482,7 +485,6 @@ void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentenc
 		int bytes = opus_encode_float(m_encoder, pcm.data() + offset, FRAME_SIZE,
 		                              frame_buf.data(), MAX_PACKET);
 		if (bytes > 0) {
-			// Prefix 2 bytes frame length (little-endian)
 			auto len = static_cast<uint16_t>(bytes);
 			message.push_back(static_cast<uint8_t>(len));
 			message.push_back(static_cast<uint8_t>(len >> 8));
@@ -494,23 +496,34 @@ void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentenc
 		offset += FRAME_SIZE;
 	}
 
+	// If is_final, pad the remaining with zeros and encode one last frame
+	if (is_final && offset < pcm.size()) {
+		std::vector<float> padded_frame(FRAME_SIZE, 0.0f);
+		std::copy(pcm.begin() + offset, pcm.end(), padded_frame.begin());
+		
+		int bytes = opus_encode_float(m_encoder, padded_frame.data(), FRAME_SIZE,
+		                              frame_buf.data(), MAX_PACKET);
+		if (bytes > 0) {
+			auto len = static_cast<uint16_t>(bytes);
+			message.push_back(static_cast<uint8_t>(len));
+			message.push_back(static_cast<uint8_t>(len >> 8));
+			message.insert(message.end(), frame_buf.begin(), frame_buf.begin() + bytes);
+			++frames_encoded;
+		} else if (bytes < 0) {
+			blog(LOG_ERROR, "[RemoteTranscriber] Opus error: %s", opus_strerror(bytes));
+		}
+	}
+
 	if (frames_encoded == 0) {
-		blog(LOG_WARNING,
-		     "[RemoteTranscriber] Zero Opus frames encoded for segment %zu",
-		     sentence_id);
+		blog(LOG_WARNING, "[RemoteTranscriber] Zero Opus frames encoded for segment %zu", sentence_id);
 		return;
 	}
 
-	blog(LOG_DEBUG, "[RemoteTranscriber] Send segment %zu: %d Opus frames, %zu bytes",
-	     sentence_id, frames_encoded, message.size());
-
 	// ── Send to network thread via asio::post ─────────────────────────────────
-	// Post send operation into io_context thread
 	std::string payload(reinterpret_cast<const char *>(message.data()), message.size());
 
 	asio::post(get_io_service(), [this, payload]() {
-		if (!m_connected.load())
-			return;
+		if (!m_connected.load()) return;
 		websocketpp::lib::error_code ec;
 		if (m_use_tls)
 			m_client_tls->send(m_hdl, payload, websocketpp::frame::opcode::binary, ec);
