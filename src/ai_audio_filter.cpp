@@ -108,8 +108,16 @@ struct ai_filter_data {
 // Build full WebSocket URL with token parameter if present
 static std::string build_full_ws_url(const std::string &url, const std::string &token, const std::string &lang_in, const std::string &lang_out)
 {
-	if (url.empty()) return url;
-	std::string full_url = url;
+	auto trim_string = [](std::string s) {
+		s.erase(std::remove_if(s.begin(), s.end(), [](unsigned char c) { return std::isspace(c); }), s.end());
+		return s;
+	};
+
+	std::string clean_url = trim_string(url);
+	std::string clean_token = trim_string(token);
+
+	if (clean_url.empty()) return clean_url;
+	std::string full_url = clean_url;
 	bool has_query = (full_url.find('?') != std::string::npos);
 
 	auto append_param = [&](const std::string &key, const std::string &val) {
@@ -122,9 +130,9 @@ static std::string build_full_ws_url(const std::string &url, const std::string &
 		else { full_url += "?" + key + "=" + val; has_query = true; }
 	};
 
-	append_param("token", token);
-	append_param("lang_in", lang_in);
-	append_param("lang_out", lang_out);
+	append_param("token", clean_token);
+	append_param("lang_in", trim_string(lang_in));
+	append_param("lang_out", trim_string(lang_out));
 
 	return full_url;
 }
