@@ -26,20 +26,21 @@ static void apply_text_color(obs_data_t *settings, long color)
 struct MyCaptionsFont {
 	obs_source_t *text_font;
 	obs_source_t *color_font;
-	long cached_bg_color;
+	long cached_bg_color{-1};
 	
+	std::string cached_raw_text;
 	std::string cached_text;
-	long cached_text_color;
-	bool cached_outline;
-	long cached_outline_color;
-	bool cached_drop_shadow;
+	long cached_text_color{-1};
+	bool cached_outline{false};
+	long cached_outline_color{-1};
+	bool cached_drop_shadow{false};
 	std::string cached_font_face;
-	int cached_font_size;
+	int cached_font_size{0};
 	std::string cached_font_style;
-	bool cached_fixed_bg_width;
-	long cached_custom_width;
-	bool cached_bottom_align;
-	int cached_max_lines;
+	bool cached_fixed_bg_width{false};
+	long cached_custom_width{-1};
+	bool cached_bottom_align{false};
+	int cached_max_lines{-1};
 	// Partial/Final color state
 	bool cached_is_partial{false};
 	bool cached_word_wrap{true};
@@ -74,6 +75,15 @@ static void *my_font_create(obs_data_t *settings, obs_source_t *source)
 	obs_data_t *text_defaults = obs_data_create();
 	obs_data_set_string(text_defaults, "text", "");
 	apply_text_color(text_defaults, 0xFFFFFFFF);
+
+	// Set initial word wrap and extents properties for both GDI+ (Windows) and FreeType2 (Linux/Mac)
+	obs_data_set_bool(text_defaults, "extents", true);
+	obs_data_set_bool(text_defaults, "extents_wrap", true);
+	obs_data_set_int(text_defaults, "extents_cx", 900);
+	obs_data_set_int(text_defaults, "extents_cy", 0);
+	obs_data_set_bool(text_defaults, "word_wrap", true);
+	obs_data_set_int(text_defaults, "custom_width", 900);
+	obs_data_set_int(text_defaults, "cx", 900);
 
 	obs_data_t *font_obj = obs_data_create();
 	obs_data_set_string(font_obj, "face", "Arial");
@@ -266,11 +276,6 @@ static void my_font_update(void *data, obs_data_t *settings)
 	// _is_partial is written by the audio filter, not shown in UI
 	bool is_partial = obs_data_get_bool(settings, "_is_partial");
 
-	ctx->cached_custom_width = custom_width;
-	ctx->cached_fixed_bg_width = fixed_bg_width && word_wrap;
-	ctx->cached_bottom_align = bottom_align;
-	ctx->cached_max_lines = max_lines;
-
 	obs_data_t *font_obj = obs_data_get_obj(settings, "font");
 	if (!font_obj) {
 		font_obj = obs_data_get_default_obj(settings, "font");
@@ -291,7 +296,15 @@ static void my_font_update(void *data, obs_data_t *settings)
 	}
 
 	const char *new_text = obs_data_get_string(settings, "text");
-	std::string text_to_set = (new_text) ? new_text : "";
+	std::string raw_text;
+	if (new_text != nullptr && strlen(new_text) > 0) {
+		raw_text = new_text;
+		ctx->cached_raw_text = raw_text;
+	} else {
+		raw_text = ctx->cached_raw_text;
+	}
+
+	std::string text_to_set = raw_text;
 
 	if (max_lines > 0 && word_wrap && custom_width > 0) {
 		// Truncate leading words to fit max line count
@@ -350,52 +363,68 @@ static void my_font_update(void *data, obs_data_t *settings)
 	}
 
 	bool text_changed = (ctx->cached_text != text_to_set);
+	bool layout_changed = (ctx->cached_custom_width != custom_width ||
+	                       ctx->cached_fixed_bg_width != (fixed_bg_width && word_wrap) ||
+	                       ctx->cached_bottom_align != bottom_align ||
+	                       ctx->cached_max_lines != max_lines ||
+	                       ctx->cached_word_wrap != word_wrap);
+
 	bool appearance_changed = (ctx->cached_text_color != text_color ||
 	                           ctx->cached_outline != outline ||
 	                           ctx->cached_outline_color != outline_color ||
 	                           ctx->cached_drop_shadow != drop_shadow ||
 	                           ctx->cached_font_face != font_face ||
 	                           ctx->cached_font_size != font_size ||
-	                           ctx->cached_font_style != font_style ||
-	                           ctx->cached_word_wrap != word_wrap);
+	                           ctx->cached_font_style != font_style);
 	
-	// AFTER computing appearance_changed, update the cached value
+	// AFTER computing changes, update cached flags
 	ctx->cached_is_partial = is_partial;
 
-	if (text_changed || appearance_changed) {
+	if (text_changed || appearance_changed || layout_changed) {
 		obs_data_t *text_settings = obs_data_create();
 		obs_data_set_string(text_settings, "text", text_to_set.c_str());
 
-		if (appearance_changed) {
-			apply_text_color(text_settings, text_color);
-			obs_data_set_bool(text_settings, "outline", outline);
-			obs_data_set_int(text_settings, "outline_color", outline_color);
-			obs_data_set_bool(text_settings, "drop_shadow", drop_shadow);
+		apply_text_color(text_settings, text_color);
+		obs_data_set_bool(text_settings, "outline", outline);
+		obs_data_set_int(text_settings, "outline_color", outline_color);
+		obs_data_set_bool(text_settings, "drop_shadow", drop_shadow);
 
-			obs_data_t *new_font_obj = obs_data_create();
-			obs_data_set_string(new_font_obj, "face", font_face.c_str());
-			obs_data_set_string(new_font_obj, "style", font_style.c_str());
-			obs_data_set_int(new_font_obj, "size", font_size);
-			obs_data_set_obj(text_settings, "font", new_font_obj);
-			obs_data_release(new_font_obj);
+		obs_data_t *new_font_obj = obs_data_create();
+		obs_data_set_string(new_font_obj, "face", font_face.c_str());
+		obs_data_set_string(new_font_obj, "style", font_style.c_str());
+		obs_data_set_int(new_font_obj, "size", font_size);
+		obs_data_set_obj(text_settings, "font", new_font_obj);
+		obs_data_release(new_font_obj);
 
-			// Enable native OBS Word Wrap so it perfectly aligns to the right edge
-			obs_data_set_bool(text_settings, "word_wrap", word_wrap);
-			obs_data_set_int(text_settings, "custom_width", custom_width);
+		// Critical cross-platform wrap width properties:
+		// Windows (text_gdiplus_v2) uses extents, extents_wrap, extents_cx, extents_cy
+		// Linux/macOS (text_ft2_source) uses word_wrap, custom_width, cx
+		obs_data_set_bool(text_settings, "extents", word_wrap);
+		obs_data_set_bool(text_settings, "extents_wrap", word_wrap);
+		obs_data_set_int(text_settings, "extents_cx", custom_width);
+		obs_data_set_int(text_settings, "extents_cy", 0);
 
-			ctx->cached_text_color = text_color;
-			ctx->cached_outline = outline;
-			ctx->cached_outline_color = outline_color;
-			ctx->cached_drop_shadow = drop_shadow;
-			ctx->cached_font_face = font_face;
-			ctx->cached_font_size = font_size;
-			ctx->cached_font_style = font_style;
-			ctx->cached_word_wrap = word_wrap;
-		}
+		obs_data_set_bool(text_settings, "word_wrap", word_wrap);
+		obs_data_set_int(text_settings, "custom_width", custom_width);
+		obs_data_set_int(text_settings, "cx", custom_width);
+
+		// Update all cached state fields
+		ctx->cached_text_color = text_color;
+		ctx->cached_outline = outline;
+		ctx->cached_outline_color = outline_color;
+		ctx->cached_drop_shadow = drop_shadow;
+		ctx->cached_font_face = font_face;
+		ctx->cached_font_size = font_size;
+		ctx->cached_font_style = font_style;
+		ctx->cached_word_wrap = word_wrap;
+		ctx->cached_custom_width = custom_width;
+		ctx->cached_fixed_bg_width = fixed_bg_width && word_wrap;
+		ctx->cached_bottom_align = bottom_align;
+		ctx->cached_max_lines = max_lines;
+		ctx->cached_text = text_to_set;
 
 		obs_source_update(ctx->text_font, text_settings);
 		obs_data_release(text_settings);
-		ctx->cached_text = text_to_set;
 	}
 
 	long bg_color = (long)obs_data_get_int(settings, "bg_color");
