@@ -37,7 +37,11 @@ TranscriptionResult RemoteTranscriber::parse_json_response(const std::string &js
 		auto npos = json.find_first_of("0123456789", colon + 1);
 		if (npos == std::string::npos)
 			return 0;
-		return static_cast<size_t>(std::stoul(json.substr(npos)));
+		try {
+			return static_cast<size_t>(std::stoul(json.substr(npos)));
+		} catch (...) {
+			return 0;
+		}
 	};
 
 	// Extract JSON boolean property

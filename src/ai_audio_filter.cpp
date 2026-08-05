@@ -608,8 +608,8 @@ obs_properties_t *ai_filter_get_properties(void *data)
 	}
 	obs_properties_add_text(group_remote, "status_label", ("Estado: " + status_msg).c_str(),
 	                        OBS_TEXT_INFO);
-	obs_properties_add_button(group_remote, "connect_btn", "🔌 Conectar / Refrescar",
-	                          on_connect_clicked);
+	obs_properties_add_button2(group_remote, "connect_btn", "🔌 Conectar / Refrescar",
+	                          on_connect_clicked, data);
 
 	obs_properties_add_text(
 		group_remote, "remote_info",
@@ -910,6 +910,10 @@ static void ai_filter_destroy(void *data)
 	if (fd->worker_thread.joinable())
 		fd->worker_thread.join();
 
+	if (fd->animator) {
+		delete fd->animator;
+		fd->animator = nullptr;
+	}
 		
 	if (fd->subtitle_weak_ref) {
 		obs_weak_source_release(fd->subtitle_weak_ref);
@@ -921,11 +925,6 @@ static void ai_filter_destroy(void *data)
 	if (fd->remote_client) {
 		delete fd->remote_client;
 		fd->remote_client = nullptr;
-	}
-
-	if (fd->animator) {
-		delete fd->animator;
-		fd->animator = nullptr;
 	}
 
 	// Clean up segment queue and buffer pool
