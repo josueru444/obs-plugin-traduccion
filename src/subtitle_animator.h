@@ -46,6 +46,16 @@ private:
 	// Track active partial sentences by sentence ID
 	std::map<size_t, std::string> m_active_partial;
 
+	// Committed prefix: text already displayed to the user for a partial sentence.
+	// New partial updates for the same sentence_id must start with this prefix
+	// or be longer than it; otherwise the update is suppressed to prevent flicker.
+	std::map<size_t, std::string> m_committed_prefix;
+
+	// Display lock: after displaying a final result, block partial updates
+	// for this duration to prevent flash between sentences.
+	int m_final_display_lock_ms{200};
+	std::chrono::steady_clock::time_point m_last_final_time;
+
 	// Cache display strings
 	std::string m_target_confirmed_string;
 	std::string m_target_partial_string;

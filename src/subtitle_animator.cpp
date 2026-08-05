@@ -47,6 +47,7 @@ void SubtitleAnimator::clear()
 		std::lock_guard<std::mutex> lock(m_mutex);
 		m_target_confirmed.clear();
 		m_active_partial.clear();
+		m_committed_prefix.clear();
 		m_target_confirmed_string = "";
 		m_target_partial_string = "";
 		m_last_update_time = std::chrono::steady_clock::now();
@@ -114,17 +115,50 @@ void SubtitleAnimator::update_text(const std::string &text, bool is_final,
 				++it;
 		}
 
+		// Clear committed prefix entries for completed sentences
+		for (auto it = m_committed_prefix.begin(); it != m_committed_prefix.end(); ) {
+			if (it->first <= sentence_id)
+				it = m_committed_prefix.erase(it);
+			else
+				++it;
+		}
+
 		// Append to confirmed history
 		if (!text.empty()) {
 			m_target_confirmed.push_back(text);
 			while (m_target_confirmed.size() > 20)
 				m_target_confirmed.pop_front();
 		}
+		m_last_final_time = std::chrono::steady_clock::now();
 	} else {
-		// Update active partial entry
+		// Update active partial entry with committed prefix logic
 		if (text.empty()) {
 			m_active_partial.erase(sentence_id);
+			m_committed_prefix.erase(sentence_id);
 		} else {
+			auto cp_it = m_committed_prefix.find(sentence_id);
+			if (cp_it != m_committed_prefix.end() && !cp_it->second.empty()) {
+				const std::string &committed = cp_it->second;
+				// Check if new text starts with the committed prefix
+				if (text.size() >= committed.size() &&
+				    text.compare(0, committed.size(), committed) == 0) {
+					// Text grew naturally — accept and extend prefix
+					m_committed_prefix[sentence_id] = text;
+				} else if (text.size() > committed.size()) {
+					// Text is longer but start changed — accept the
+					// correction (AI refined the translation)
+					m_committed_prefix[sentence_id] = text;
+				} else {
+					// Text is shorter or same length with different start.
+					// Suppress this update — wait for final to correct.
+					rebuild_target_strings();
+					m_cv.notify_one();
+					return;
+				}
+			} else {
+				// First partial for this sentence_id
+				m_committed_prefix[sentence_id] = text;
+			}
 			m_active_partial[sentence_id] = text;
 		}
 
@@ -132,6 +166,13 @@ void SubtitleAnimator::update_text(const std::string &text, bool is_final,
 		for (auto it = m_active_partial.begin(); it != m_active_partial.end(); ) {
 			if (it->first < sentence_id)
 				it = m_active_partial.erase(it);
+			else
+				++it;
+		}
+		// Evict stale committed prefix entries
+		for (auto it = m_committed_prefix.begin(); it != m_committed_prefix.end(); ) {
+			if (it->first < sentence_id)
+				it = m_committed_prefix.erase(it);
 			else
 				++it;
 		}
@@ -155,6 +196,8 @@ void SubtitleAnimator::worker_loop()
 		std::string target_partial;
 		int throttle_ms;
 
+		int final_lock_ms;
+		std::chrono::steady_clock::time_point last_final_tp;
 		{
 			std::unique_lock<std::mutex> lock(m_mutex);
 			m_cv.wait_for(lock, std::chrono::milliseconds(50),
@@ -169,6 +212,8 @@ void SubtitleAnimator::worker_loop()
 			target_confirmed = m_target_confirmed_string;
 			target_partial   = m_target_partial_string;
 			throttle_ms      = m_partial_throttle_ms;
+			final_lock_ms    = m_final_display_lock_ms;
+			last_final_tp    = m_last_final_time;
 		}
 
 		if (target_confirmed == current_confirmed && target_partial == current_partial)
@@ -192,6 +237,13 @@ void SubtitleAnimator::worker_loop()
 		auto now  = std::chrono::steady_clock::now();
 		auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(
 			now - last_partial_tick).count();
+
+		// Display lock: suppress partial updates briefly after a final
+		auto since_final = std::chrono::duration_cast<std::chrono::milliseconds>(
+			now - last_final_tp).count();
+		if (since_final < final_lock_ms) {
+			continue;
+		}
 
 		// Check if partial text was cleared
 		bool partial_cleared = target_partial.empty() && !current_partial.empty();
