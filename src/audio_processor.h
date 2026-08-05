@@ -15,7 +15,7 @@ class audio_processor
 
       private:
     struct whisper_context *ctx = nullptr;
-    // Store whisper parameters here if needed to avoid recreation per call
+    // Store Whisper parameters to avoid re-creation per call
     // struct whisper_full_params wparams;
 };
 

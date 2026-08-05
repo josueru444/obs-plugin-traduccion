@@ -49,7 +49,7 @@ std::string audio_processor::process_audio(const std::vector<float> &pcmf32, con
 	wparams.language = language.c_str();
 	wparams.translate = translate;
 
-	// Anti-hallucination configuration
+	// Configure anti-hallucination thresholds
 	wparams.suppress_blank = true;
 	wparams.suppress_nst = true;
 	wparams.entropy_thold = 2.40f;

@@ -20,6 +20,8 @@ add_library(${CMAKE_PROJECT_NAME} MODULE
         #ui/setup.h
         src/ai_subtitle_source.cpp
         src/ai_subtitle_source.h
+        src/subtitle_animator.cpp
+        src/subtitle_animator.h
         src/audio_processor.cpp
         src/audio_processor.h
         src/remote_transcriber.cpp

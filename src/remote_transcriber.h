@@ -1,6 +1,6 @@
 #pragma once
 
-// Windows: include Winsock2 headers before Asio to avoid conflicts
+// Include Windows headers before Asio
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -8,7 +8,7 @@
 #include <windows.h>
 #endif
 
-// Define macros before including websocketpp/asio
+// Define Asio macros for WebSocketPP
 #ifndef ASIO_STANDALONE
 #define ASIO_STANDALONE
 #endif
@@ -37,31 +37,14 @@
 #include <thread>
 #include <vector>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Result returned by WebSocket server (JSON format)
-// {"text": "Hello world", "sentence_id": 3, "is_final": true}
-// ─────────────────────────────────────────────────────────────────────────────
+// Represent transcription result received from remote server
 struct TranscriptionResult {
 	std::string text;
 	size_t sentence_id = 0;
 	bool is_final = false;
 };
 
-// ─────────────────────────────────────────────────────────────────────────────
-// RemoteTranscriber
-//
-// Responsibilities:
-//   1. Maintain persistent WebSocket connection to transcription server.
-//   2. Reconnect automatically on connection loss.
-//   3. Encode PCM audio (16kHz, mono, float32) -> Opus and send as binary.
-//   4. Receive JSON response from server and invoke on_result callback.
-//   5. Support both ws:// (plain) and wss:// (TLS) connections.
-//
-// Binary protocol sent to server:
-//   [4 bytes: sentence_id (uint32 LE)]
-//   [1 byte:  is_final (0 or 1)]
-//   [per Opus frame: [2 bytes length LE][N bytes Opus data]]
-// ─────────────────────────────────────────────────────────────────────────────
+// Maintain WebSocket client connection and stream Opus-encoded audio
 class RemoteTranscriber {
 public:
 	using WsClientPlain = websocketpp::client<websocketpp::config::asio_client>;
@@ -77,23 +60,10 @@ public:
 	RemoteTranscriber(const RemoteTranscriber &) = delete;
 	RemoteTranscriber &operator=(const RemoteTranscriber &) = delete;
 
-	/**
-	 * Update WebSocket URL and reconnect if changed.
-	 * Thread-safe: call from any thread.
-	 * Note: cannot switch between ws:// and wss:// at runtime.
-	 *
-	 * @param new_url New WebSocket target URL
-	 */
+	// Update WebSocket target URL and reconnect
 	void update_url(const std::string &new_url);
 
-	/**
-	 * Encode speech segment to Opus and send to server.
-	 * Thread-safe: call from any thread.
-	 *
-	 * @param pcm_16khz  Raw PCM audio: 16kHz, mono, float32 in [-1.0, 1.0]
-	 * @param sentence_id Unique segment identifier (for server response correlation)
-	 * @param is_final    true if final sentence segment (silence after speech)
-	 */
+	// Encode PCM audio to Opus and send segment to server
 	void send_audio(const std::vector<float> &pcm_16khz, size_t sentence_id, bool is_final);
 
 	bool is_connected() const { return m_connected.load(); }
@@ -135,6 +105,11 @@ private:
 
 	// ── Opus ───────────────────────────────────────────────────────────────────
 	OpusEncoder *m_encoder{nullptr};
+
+	// Cache Opus encoding state incrementally
+	size_t m_cached_sentence_id{static_cast<size_t>(-1)};
+	std::vector<uint8_t> m_encoded_frames_cache;
+	size_t m_encoded_pcm_count{0};
 
 	static constexpr int SAMPLE_RATE = 16000; // Hz
 	static constexpr int CHANNELS = 1;        // mono

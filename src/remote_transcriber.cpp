@@ -4,16 +4,12 @@
 #include <asio/steady_timer.hpp>
 #include <chrono>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Minimal JSON Parser
-// Expect: {"text": "...", "sentence_id": N, "is_final": true/false}
-// Avoid external dependencies to keep binary size small.
-// ─────────────────────────────────────────────────────────────────────────────
+// Parse JSON response payload
 TranscriptionResult RemoteTranscriber::parse_json_response(const std::string &json)
 {
 	TranscriptionResult result;
 
-	// Extract value of a JSON string field: "key": "value"
+	// Extract JSON string property
 	auto extract_string = [&](const std::string &key) -> std::string {
 		auto kpos = json.find("\"" + key + "\"");
 		if (kpos == std::string::npos)
@@ -30,7 +26,7 @@ TranscriptionResult RemoteTranscriber::parse_json_response(const std::string &js
 		return json.substr(q1 + 1, q2 - q1 - 1);
 	};
 
-	// Extract value of a JSON unsigned integer field: "key": 42
+	// Extract JSON unsigned integer property
 	auto extract_uint = [&](const std::string &key) -> size_t {
 		auto kpos = json.find("\"" + key + "\"");
 		if (kpos == std::string::npos)
@@ -44,7 +40,7 @@ TranscriptionResult RemoteTranscriber::parse_json_response(const std::string &js
 		return static_cast<size_t>(std::stoul(json.substr(npos)));
 	};
 
-	// Extract value of a JSON boolean field: "key": true/false
+	// Extract JSON boolean property
 	auto extract_bool = [&](const std::string &key) -> bool {
 		auto kpos = json.find("\"" + key + "\"");
 		if (kpos == std::string::npos)
@@ -64,20 +60,13 @@ TranscriptionResult RemoteTranscriber::parse_json_response(const std::string &js
 	return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: get io_service from the active client
-// ─────────────────────────────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
-// Helper: get io_service
-// ─────────────────────────────────────────────────────────────────────────────
+// Return reference to io_service context
 asio::io_service &RemoteTranscriber::get_io_service()
 {
 	return m_io_service;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Process incoming text message (shared logic for both client types)
-// ─────────────────────────────────────────────────────────────────────────────
+// Process incoming WebSocket message payload
 void RemoteTranscriber::process_message(const std::string &payload)
 {
 	TranscriptionResult res = parse_json_response(payload);
@@ -86,9 +75,7 @@ void RemoteTranscriber::process_message(const std::string &payload)
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Constructor
-// ─────────────────────────────────────────────────────────────────────────────
+// Initialize network transcriber client instance
 RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_result, StatusCallback on_status)
 	: m_url(url), m_callback(std::move(on_result)), m_status_cb(std::move(on_status)),
 	  m_use_tls(url.size() >= 6 && url.substr(0, 6) == "wss://"),
@@ -97,30 +84,27 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 {
 	blog(LOG_INFO, "[RemoteTranscriber] Protocol: %s", m_use_tls ? "wss (TLS)" : "ws (plain)");
 
-	// ── Initialize Opus encoder ───────────────────────────────────────────────
+	// Initialize Opus encoder
 	int err = OPUS_OK;
 	m_encoder = opus_encoder_create(SAMPLE_RATE, CHANNELS, OPUS_APPLICATION_VOIP, &err);
 	if (err != OPUS_OK || !m_encoder) {
 		blog(LOG_ERROR, "[RemoteTranscriber] opus_encoder_create failed: %s", opus_strerror(err));
 		m_encoder = nullptr;
 	} else {
-		// Set 24kbps bitrate (sufficient for speech-to-text)
+		// Configure Opus encoder parameters
 		opus_encoder_ctl(m_encoder, OPUS_SET_BITRATE(24000));
-		// Optimize codec for voice signal
 		opus_encoder_ctl(m_encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
-		// Set complexity to 5/10 (balance CPU usage and quality)
 		opus_encoder_ctl(m_encoder, OPUS_SET_COMPLEXITY(5));
-		// Disable DTX to send all frames continuously
 		opus_encoder_ctl(m_encoder, OPUS_SET_DTX(0));
 		blog(LOG_INFO, "[RemoteTranscriber] Opus encoder initialized (16kHz, mono, 24kbps)");
 	}
 
-	// ── Initialize BOTH WebSocket clients on shared io_service ───────────────
+	// Configure TLS and plain WebSocket client handlers
 	auto open_handler = [this](websocketpp::connection_hdl hdl) { on_open(hdl); };
 	auto close_handler = [this](websocketpp::connection_hdl hdl) { on_close(hdl); };
 	auto fail_handler = [this](websocketpp::connection_hdl hdl) { on_fail(hdl); };
 
-	// 1. TLS Client (for wss://)
+	// Configure TLS client
 	m_client_tls = std::make_unique<WsClientTls>();
 	m_client_tls->init_asio(&m_io_service);
 	m_client_tls->set_tls_init_handler([](websocketpp::connection_hdl) -> SslContext {
@@ -170,7 +154,7 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 				process_message(msg->get_payload());
 		});
 
-	// 2. Plain Client (for ws://)
+	// Configure plain WS client
 	m_client_plain = std::make_unique<WsClientPlain>();
 	m_client_plain->init_asio(&m_io_service);
 	m_client_plain->clear_access_channels(websocketpp::log::alevel::all);
@@ -184,7 +168,7 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 				process_message(msg->get_payload());
 		});
 
-	// Run asio io_service in single dedicated network thread
+	// Run Asio event loop on dedicated network thread
 	m_io_thread = std::thread([this]() {
 		blog(LOG_INFO, "[RemoteTranscriber] Network thread started");
 		m_io_service.run();
@@ -199,10 +183,7 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 	}
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Destructor
-// Stop io_thread BEFORE freeing filter resources
-// ─────────────────────────────────────────────────────────────────────────────
+// Clean up network transcriber resources
 RemoteTranscriber::~RemoteTranscriber()
 {
 	if (m_alive) {
@@ -238,9 +219,7 @@ static bool is_same_hdl(const websocketpp::connection_hdl &h1, const websocketpp
 	return !h1.owner_before(h2) && !h2.owner_before(h1);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Connection management
-// ─────────────────────────────────────────────────────────────────────────────
+// Update WebSocket endpoint URL and reconnect
 void RemoteTranscriber::update_url(const std::string &new_url)
 {
 	if (!m_running.load())
@@ -261,6 +240,7 @@ void RemoteTranscriber::update_url(const std::string &new_url)
 }
 
 
+// Initiate WebSocket connection
 void RemoteTranscriber::connect()
 {
 	if (!m_running.load())
@@ -375,10 +355,7 @@ void RemoteTranscriber::schedule_reconnect()
 	});
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Handle WebSocket events
-// (executed inside network / io_context thread)
-// ─────────────────────────────────────────────────────────────────────────────
+// Handle WebSocket connection open event
 void RemoteTranscriber::on_open(websocketpp::connection_hdl hdl)
 {
 	if (!is_same_hdl(hdl, m_hdl))
@@ -438,15 +415,7 @@ void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 	schedule_reconnect();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// PCM to Opus encoding and packet send
-//
-// Binary message protocol:
-//   Bytes 0-3  : sentence_id (uint32, little-endian)
-//   Byte  4    : is_final    (0 = partial, 1 = final)
-//   Bytes 5+   : Opus frames prefixed with length:
-//                  [2 bytes length LE][N bytes Opus data]
-// ─────────────────────────────────────────────────────────────────────────────
+// Encode PCM audio to Opus and send segment over WebSocket
 void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentence_id, bool is_final)
 {
 	if (!m_connected.load()) {
@@ -459,13 +428,68 @@ void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentenc
 	if (pcm.empty())
 		return;
 
-	// Reset Opus encoder state since we are encoding a full audio segment from the start
-	opus_encoder_ctl(m_encoder, OPUS_RESET_STATE);
+	// ── Incremental encoding cache management ─────────────────────────────────
+	// If this is a new sentence, reset the encoder and the frame cache.
+	if (sentence_id != m_cached_sentence_id) {
+		opus_encoder_ctl(m_encoder, OPUS_RESET_STATE);
+		m_encoded_frames_cache.clear();
+		m_encoded_pcm_count = 0;
+		m_cached_sentence_id = sentence_id;
+		blog(LOG_DEBUG, "[RemoteTranscriber] New sentence_id=%zu, resetting Opus cache", sentence_id);
+	}
 
-	// ── Build binary message ──────────────────────────────────────────────────
+	// ── Encode only the NEW PCM samples since last call ───────────────────────
+	// m_encoded_pcm_count tracks how many samples have already been encoded.
+	// We advance to the next complete FRAME_SIZE boundary from that offset.
+	std::vector<uint8_t> frame_buf(MAX_PACKET);
+	size_t offset = (m_encoded_pcm_count / FRAME_SIZE) * FRAME_SIZE; // align to frame boundary
+	int frames_encoded = 0;
+
+	while (offset + static_cast<size_t>(FRAME_SIZE) <= pcm.size()) {
+		int bytes = opus_encode_float(m_encoder, pcm.data() + offset, FRAME_SIZE,
+		                              frame_buf.data(), MAX_PACKET);
+		if (bytes > 0) {
+			auto len = static_cast<uint16_t>(bytes);
+			m_encoded_frames_cache.push_back(static_cast<uint8_t>(len));
+			m_encoded_frames_cache.push_back(static_cast<uint8_t>(len >> 8));
+			m_encoded_frames_cache.insert(m_encoded_frames_cache.end(),
+			                              frame_buf.begin(), frame_buf.begin() + bytes);
+			++frames_encoded;
+		} else if (bytes < 0) {
+			blog(LOG_ERROR, "[RemoteTranscriber] Opus encode error: %s", opus_strerror(bytes));
+		}
+		offset += FRAME_SIZE;
+	}
+	m_encoded_pcm_count = offset; // remember up to which sample we've encoded
+
+	// On final message: encode any remaining samples (padded to one full frame)
+	if (is_final && offset < pcm.size()) {
+		std::vector<float> padded_frame(FRAME_SIZE, 0.0f);
+		std::copy(pcm.begin() + offset, pcm.end(), padded_frame.begin());
+		int bytes = opus_encode_float(m_encoder, padded_frame.data(), FRAME_SIZE,
+		                              frame_buf.data(), MAX_PACKET);
+		if (bytes > 0) {
+			auto len = static_cast<uint16_t>(bytes);
+			m_encoded_frames_cache.push_back(static_cast<uint8_t>(len));
+			m_encoded_frames_cache.push_back(static_cast<uint8_t>(len >> 8));
+			m_encoded_frames_cache.insert(m_encoded_frames_cache.end(),
+			                              frame_buf.begin(), frame_buf.begin() + bytes);
+			++frames_encoded;
+		} else if (bytes < 0) {
+			blog(LOG_ERROR, "[RemoteTranscriber] Opus encode error (final pad): %s", opus_strerror(bytes));
+		}
+	}
+
+	if (m_encoded_frames_cache.empty()) {
+		blog(LOG_WARNING, "[RemoteTranscriber] No Opus frames in cache for segment %zu", sentence_id);
+		return;
+	}
+
+	// ── Build binary message with header + ALL cached frames ──────────────────
+	// The server needs the full audio context to transcribe accurately, but now
+	// we build the message from the cache (already encoded) — no re-encoding.
 	std::vector<uint8_t> message;
-	// Reserve estimated size: header(5) + ~80 bytes per 20ms frame
-	message.reserve(5 + (pcm.size() / FRAME_SIZE + 1) * 80);
+	message.reserve(5 + m_encoded_frames_cache.size());
 
 	// Header: sentence_id (4 bytes, little-endian)
 	auto sid = static_cast<uint32_t>(sentence_id);
@@ -476,47 +500,18 @@ void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentenc
 	// Header: is_final (1 byte)
 	message.push_back(is_final ? 1 : 0);
 
-	// ── Encode Opus frames (20ms per frame = 320 samples at 16kHz) ────────────
-	std::vector<uint8_t> frame_buf(MAX_PACKET);
-	size_t offset = 0;
-	int frames_encoded = 0;
+	// Body: cached Opus frames
+	message.insert(message.end(), m_encoded_frames_cache.begin(), m_encoded_frames_cache.end());
 
-	while (offset + static_cast<size_t>(FRAME_SIZE) <= pcm.size()) {
-		int bytes = opus_encode_float(m_encoder, pcm.data() + offset, FRAME_SIZE,
-		                              frame_buf.data(), MAX_PACKET);
-		if (bytes > 0) {
-			auto len = static_cast<uint16_t>(bytes);
-			message.push_back(static_cast<uint8_t>(len));
-			message.push_back(static_cast<uint8_t>(len >> 8));
-			message.insert(message.end(), frame_buf.begin(), frame_buf.begin() + bytes);
-			++frames_encoded;
-		} else if (bytes < 0) {
-			blog(LOG_ERROR, "[RemoteTranscriber] Opus error: %s", opus_strerror(bytes));
-		}
-		offset += FRAME_SIZE;
-	}
+	blog(LOG_DEBUG,
+	     "[RemoteTranscriber] -> send_audio sid=%zu %s | new_frames=%d | total_cache=%zu bytes",
+	     sentence_id, is_final ? "FINAL" : "PARTIAL", frames_encoded, m_encoded_frames_cache.size());
 
-	// If is_final, pad the remaining with zeros and encode one last frame
-	if (is_final && offset < pcm.size()) {
-		std::vector<float> padded_frame(FRAME_SIZE, 0.0f);
-		std::copy(pcm.begin() + offset, pcm.end(), padded_frame.begin());
-		
-		int bytes = opus_encode_float(m_encoder, padded_frame.data(), FRAME_SIZE,
-		                              frame_buf.data(), MAX_PACKET);
-		if (bytes > 0) {
-			auto len = static_cast<uint16_t>(bytes);
-			message.push_back(static_cast<uint8_t>(len));
-			message.push_back(static_cast<uint8_t>(len >> 8));
-			message.insert(message.end(), frame_buf.begin(), frame_buf.begin() + bytes);
-			++frames_encoded;
-		} else if (bytes < 0) {
-			blog(LOG_ERROR, "[RemoteTranscriber] Opus error: %s", opus_strerror(bytes));
-		}
-	}
-
-	if (frames_encoded == 0) {
-		blog(LOG_WARNING, "[RemoteTranscriber] Zero Opus frames encoded for segment %zu", sentence_id);
-		return;
+	// On final, clear the cache — this sentence is done.
+	if (is_final) {
+		m_encoded_frames_cache.clear();
+		m_encoded_pcm_count = 0;
+		m_cached_sentence_id = static_cast<size_t>(-1);
 	}
 
 	// ── Send to network thread via asio::post ─────────────────────────────────

@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-// ¡Solo anunciamos que esta función existe! El código real estará en el .cpp
+// Declare font info getter
 struct obs_source_info get_my_font_info();
 
 #ifdef __cplusplus
