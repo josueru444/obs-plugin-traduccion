@@ -95,7 +95,7 @@ struct ai_filter_data {
 	audio_resampler_t *resampler;
 	uint32_t resampler_src_rate;
 
-	struct whisper_vad_context *vad_ctx;
+	struct whisper_vad_context *vad_ctx{nullptr};
 
 	// ── Auto-clear & Performance ──────────────────────────────────────────
 	obs_weak_source_t *subtitle_weak_ref{nullptr};
@@ -322,11 +322,15 @@ static void transcription_worker(ai_filter_data *data)
 				for (float s : pcmf32) sum += s * s;
 				float rms = std::sqrt(sum / (float)pcmf32.size());
 
-				// Detect speech with Silero VAD
+				// Detect speech with Silero VAD (or fallback to RMS if VAD model missing)
 				bool is_speech = false;
-				if (rms > SILENCE_RMS_THRESHOLD && data->vad_ctx) {
-					is_speech = whisper_vad_detect_speech_no_reset(
-						data->vad_ctx, pcmf32.data(), pcmf32.size());
+				if (data->vad_ctx) {
+					if (rms > SILENCE_RMS_THRESHOLD) {
+						is_speech = whisper_vad_detect_speech_no_reset(
+							data->vad_ctx, pcmf32.data(), pcmf32.size());
+					}
+				} else {
+					is_speech = (rms > SILENCE_RMS_THRESHOLD * 2.0f); // Higher threshold for fallback
 				}
 
 				size_t frame_ms = (pcmf32.size() * 1000) / 16000;
@@ -876,9 +880,6 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 		data->processor = new audio_processor(data->current_model_path);
 	}
 
-	// Start worker thread
-	data->worker_thread = std::thread(transcription_worker, data);
-
 	// Initialize Silero VAD
 	struct whisper_vad_context_params vad_params = whisper_vad_default_context_params();
 	char *vad_model_path = obs_module_file("models/silero_vad.bin");
@@ -887,7 +888,15 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 		bfree(vad_model_path);
 	} else {
 		data->vad_ctx = nullptr;
+		blog(LOG_WARNING, "[AI Translator] Silero VAD model not found. Using RMS fallback.");
 	}
+
+	if (!data->vad_ctx && vad_model_path) {
+		blog(LOG_WARNING, "[AI Translator] Failed to load Silero VAD model. Using RMS fallback.");
+	}
+
+	// Start worker thread AFTER VAD initialization to avoid race conditions
+	data->worker_thread = std::thread(transcription_worker, data);
 
 	data->vad.speech_frames.reserve(16000 * 30);
 	data->vad.preroll.reserve(16000);
