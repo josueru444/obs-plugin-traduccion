@@ -17,8 +17,12 @@
 #endif
 
 #include <websocketpp/config/asio_no_tls_client.hpp>
-#include <websocketpp/config/asio_client.hpp>
 #include <websocketpp/client.hpp>
+
+#ifdef HAVE_OPENSSL
+#include <websocketpp/config/asio_client.hpp>
+#include <asio/ssl.hpp>
+#endif
 
 #if defined(__has_include) && __has_include(<opus/opus.h>)
 #include <opus/opus.h>
@@ -27,8 +31,6 @@
 #else
 #include <opus/opus.h>
 #endif
-
-#include <asio/ssl.hpp>
 
 #include <atomic>
 #include <functional>
@@ -48,8 +50,10 @@ struct TranscriptionResult {
 class RemoteTranscriber {
 public:
 	using WsClientPlain = websocketpp::client<websocketpp::config::asio_client>;
+#ifdef HAVE_OPENSSL
 	using WsClientTls = websocketpp::client<websocketpp::config::asio_tls_client>;
 	using SslContext = websocketpp::lib::shared_ptr<asio::ssl::context>;
+#endif
 	using ResultCallback = std::function<void(const TranscriptionResult &)>;
 	using StatusCallback = std::function<void(const std::string &)>;
 
@@ -96,7 +100,9 @@ private:
 	asio::io_service m_io_service;
 	asio::executor_work_guard<asio::io_service::executor_type> m_work_guard;
 	std::unique_ptr<WsClientPlain> m_client_plain;
+#ifdef HAVE_OPENSSL
 	std::unique_ptr<WsClientTls> m_client_tls;
+#endif
 	websocketpp::connection_hdl m_hdl;
 	std::thread m_io_thread;
 	std::atomic<bool> m_connected{false};

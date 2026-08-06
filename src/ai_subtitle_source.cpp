@@ -98,6 +98,21 @@ static void *my_font_create(obs_data_t *settings, obs_source_t *source)
 	obs_data_set_int(bg_defaults, "color", 0x80000000);
 
 	data->text_font = obs_source_create_private(TEXT_SOURCE_ID, "intern_text", text_defaults);
+#if defined(_WIN32)
+	if (!data->text_font) {
+		data->text_font = obs_source_create_private("text_gdiplus", "intern_text", text_defaults);
+	}
+	if (!data->text_font) {
+		data->text_font = obs_source_create_private("text_ft2_source_v2", "intern_text", text_defaults);
+	}
+	if (!data->text_font) {
+		data->text_font = obs_source_create_private("text_ft2_source", "intern_text", text_defaults);
+	}
+#endif
+	if (!data->text_font) {
+		blog(LOG_ERROR, "[AI Translator] Failed to create internal text font source for subtitles!");
+	}
+
 	data->color_font = obs_source_create_private("color_source", "intern_color", bg_defaults);
 
 	obs_data_release(text_defaults);

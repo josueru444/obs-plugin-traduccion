@@ -8,7 +8,7 @@
 class audio_processor
 {
       public:
-    audio_processor(const std::string &model_path);
+    audio_processor(const std::string &model_path, bool use_gpu = false);
     ~audio_processor();
 
 	std::string process_audio(const std::vector<float> &pcmf32, const std::string &language = "auto", bool translate = false, const std::string &initial_prompt = "", int n_threads = 4);

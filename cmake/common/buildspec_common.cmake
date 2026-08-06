@@ -53,22 +53,38 @@ function(_setup_obs_studio)
   endif()
 
   if(OS_WINDOWS)
-    set(_cmake_generator "${CMAKE_GENERATOR}")
-    set(_cmake_arch "-A ${arch},version=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
-    set(_cmake_extra "-DCMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION} -DCMAKE_ENABLE_SCRIPTING=OFF")
+    if(NOT CMAKE_GENERATOR MATCHES "Visual Studio")
+      if(EXISTS "C:/Program Files/Microsoft Visual Studio/18" OR EXISTS "C:/Program Files (x86)/Microsoft Visual Studio/18")
+        set(_cmake_generator "Visual Studio 18 2026")
+      elseif(EXISTS "C:/Program Files/Microsoft Visual Studio/2022" OR EXISTS "C:/Program Files (x86)/Microsoft Visual Studio/2022")
+        set(_cmake_generator "Visual Studio 17 2022")
+      else()
+        set(_cmake_generator "Visual Studio 18 2026")
+      endif()
+    else()
+      set(_cmake_generator "${CMAKE_GENERATOR}")
+    endif()
+    if(NOT CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION OR CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION STREQUAL "")
+      set(CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION "10.0.22621.0")
+    endif()
+    set(_cmake_arch -A "${arch},version=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
+    set(_cmake_extra "-DCMAKE_SYSTEM_VERSION=${CMAKE_SYSTEM_VERSION}" "-DCMAKE_ENABLE_SCRIPTING=OFF" "-DCMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION=${CMAKE_VS_WINDOWS_TARGET_PLATFORM_VERSION}")
   elseif(OS_MACOS)
     set(_cmake_generator "Xcode")
-    set(_cmake_arch "-DCMAKE_OSX_ARCHITECTURES:STRING='arm64;x86_64'")
+    set(_cmake_arch "-DCMAKE_OSX_ARCHITECTURES:STRING=arm64;x86_64")
     set(_cmake_extra "-DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET}")
   endif()
+
+  set(_obs_target obs-frontend-api)
+  set(_enable_frontend ON)
 
   message(STATUS "Configure ${label} (${arch})")
   execute_process(
     COMMAND
       "${CMAKE_COMMAND}" -S "${dependencies_dir}/${_obs_destination}" -B
-      "${dependencies_dir}/${_obs_destination}/build_${arch}" -G ${_cmake_generator} "${_cmake_arch}"
-      -DOBS_CMAKE_VERSION:STRING=3.0.0 -DENABLE_PLUGINS:BOOL=OFF -DENABLE_FRONTEND:BOOL=OFF
-      -DOBS_VERSION_OVERRIDE:STRING=${_obs_version} "-DCMAKE_PREFIX_PATH='${CMAKE_PREFIX_PATH}'" ${_is_fresh}
+      "${dependencies_dir}/${_obs_destination}/build_${arch}" -G "${_cmake_generator}" ${_cmake_arch}
+      -DOBS_CMAKE_VERSION:STRING=3.0.0 -DENABLE_PLUGINS:BOOL=OFF -DENABLE_FRONTEND:BOOL=${_enable_frontend}
+      -DOBS_VERSION_OVERRIDE:STRING=${_obs_version} "-DCMAKE_PREFIX_PATH=${CMAKE_PREFIX_PATH}" ${_is_fresh}
       ${_cmake_extra}
     RESULT_VARIABLE _process_result
     COMMAND_ERROR_IS_FATAL ANY
@@ -78,7 +94,7 @@ function(_setup_obs_studio)
 
   message(STATUS "Build ${label} (Debug - ${arch})")
   execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config Debug --parallel
+    COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target ${_obs_target} --config Debug --parallel
     WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
     RESULT_VARIABLE _process_result
     COMMAND_ERROR_IS_FATAL ANY
@@ -88,13 +104,13 @@ function(_setup_obs_studio)
 
   message(STATUS "Build ${label} (Release - ${arch})")
   execute_process(
-    COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target obs-frontend-api --config Release --parallel
+    COMMAND "${CMAKE_COMMAND}" --build build_${arch} --target ${_obs_target} --config Release --parallel
     WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
     RESULT_VARIABLE _process_result
     COMMAND_ERROR_IS_FATAL ANY
     OUTPUT_QUIET
   )
-  message(STATUS "Build ${label} (Reelase - ${arch}) - done")
+  message(STATUS "Build ${label} (Release - ${arch}) - done")
 
   message(STATUS "Install ${label} (${arch})")
   execute_process(
@@ -102,7 +118,6 @@ function(_setup_obs_studio)
       "${CMAKE_COMMAND}" --install build_${arch} --component Development --config Debug --prefix "${dependencies_dir}"
     WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
     RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
     OUTPUT_QUIET
   )
   execute_process(
@@ -110,7 +125,6 @@ function(_setup_obs_studio)
       "${CMAKE_COMMAND}" --install build_${arch} --component Development --config Release --prefix "${dependencies_dir}"
     WORKING_DIRECTORY "${dependencies_dir}/${_obs_destination}"
     RESULT_VARIABLE _process_result
-    COMMAND_ERROR_IS_FATAL ANY
     OUTPUT_QUIET
   )
   message(STATUS "Install ${label} (${arch}) - done")

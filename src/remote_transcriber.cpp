@@ -108,6 +108,7 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 	auto close_handler = [this](websocketpp::connection_hdl hdl) { on_close(hdl); };
 	auto fail_handler = [this](websocketpp::connection_hdl hdl) { on_fail(hdl); };
 
+#ifdef HAVE_OPENSSL
 	// Configure TLS client
 	m_client_tls = std::make_unique<WsClientTls>();
 	m_client_tls->init_asio(&m_io_service);
@@ -157,6 +158,7 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 			if (msg->get_opcode() == websocketpp::frame::opcode::text)
 				process_message(msg->get_payload());
 		});
+#endif
 
 	// Configure plain WS client
 	m_client_plain = std::make_unique<WsClientPlain>();
@@ -199,8 +201,10 @@ RemoteTranscriber::~RemoteTranscriber()
 	m_connected.store(false);
 
 	// Stop both clients cleanly
+#ifdef HAVE_OPENSSL
 	if (m_client_tls)
 		m_client_tls->stop();
+#endif
 	if (m_client_plain)
 		m_client_plain->stop();
 
@@ -254,9 +258,12 @@ void RemoteTranscriber::connect()
 	m_connected.store(false);
 	if (!m_hdl.expired()) {
 		websocketpp::lib::error_code ec;
+#ifdef HAVE_OPENSSL
 		if (m_use_tls && m_client_tls)
 			m_client_tls->close(m_hdl, websocketpp::close::status::going_away, "Reconnecting", ec);
-		else if (!m_use_tls && m_client_plain)
+		else
+#endif
+		if (!m_use_tls && m_client_plain)
 			m_client_plain->close(m_hdl, websocketpp::close::status::going_away, "Reconnecting", ec);
 		m_hdl.reset();
 	}
@@ -286,6 +293,7 @@ void RemoteTranscriber::connect()
 
 
 	if (m_use_tls) {
+#ifdef HAVE_OPENSSL
 		websocketpp::lib::error_code ec;
 		auto con = m_client_tls->get_connection(m_url, ec);
 		if (ec) {
@@ -311,6 +319,12 @@ void RemoteTranscriber::connect()
 
 		m_hdl = con->get_handle();
 		m_client_tls->connect(con);
+#else
+		blog(LOG_WARNING, "[RemoteTranscriber] OpenSSL is disabled. Cannot connect to wss:// URL: %s", m_url.c_str());
+		if (m_status_cb)
+			m_status_cb("🔴 TLS no disponible");
+		return;
+#endif
 	} else {
 		websocketpp::lib::error_code ec;
 		auto con = m_client_plain->get_connection(m_url, ec);
@@ -394,6 +408,7 @@ void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 
 	std::string err_reason = "Unknown error";
 	websocketpp::lib::error_code ec;
+#ifdef HAVE_OPENSSL
 	if (m_use_tls && m_client_tls) {
 		auto con = m_client_tls->get_con_from_hdl(hdl, ec);
 		if (!ec && con) {
@@ -403,7 +418,9 @@ void RemoteTranscriber::on_fail(websocketpp::connection_hdl hdl)
 					      con->get_response_msg() + ")";
 			}
 		}
-	} else if (!m_use_tls && m_client_plain) {
+	} else
+#endif
+	if (!m_use_tls && m_client_plain) {
 		auto con = m_client_plain->get_con_from_hdl(hdl, ec);
 		if (!ec && con) {
 			err_reason = con->get_ec().message();
@@ -524,9 +541,12 @@ void RemoteTranscriber::send_audio(const std::vector<float> &pcm, size_t sentenc
 	asio::post(get_io_service(), [this, payload]() {
 		if (!m_connected.load()) return;
 		websocketpp::lib::error_code ec;
-		if (m_use_tls)
+#ifdef HAVE_OPENSSL
+		if (m_use_tls && m_client_tls)
 			m_client_tls->send(m_hdl, payload, websocketpp::frame::opcode::binary, ec);
 		else
+#endif
+		if (!m_use_tls && m_client_plain)
 			m_client_plain->send(m_hdl, payload, websocketpp::frame::opcode::binary, ec);
 		if (ec) {
 			blog(LOG_ERROR, "[RemoteTranscriber] Send error: %s", ec.message().c_str());
