@@ -308,7 +308,7 @@ static void my_font_update(void *data, obs_data_t *settings)
 
 	const char *new_text = obs_data_get_string(settings, "text");
 	std::string raw_text;
-	if (new_text != nullptr && strlen(new_text) > 0) {
+	if (new_text != nullptr) {
 		raw_text = new_text;
 		ctx->cached_raw_text = raw_text;
 	} else {
