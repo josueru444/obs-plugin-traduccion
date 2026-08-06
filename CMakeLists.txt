@@ -117,21 +117,35 @@ else()
 endif()
 
 # === OpenSSL (required for wss:// TLS WebSocket connections) ===
-find_package(OpenSSL REQUIRED)
-target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
-message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
+find_package(OpenSSL QUIET)
 
-if(WIN32)
-    # Find OpenSSL root directory safely via INCLUDE_DIR instead of IMPORTED_LOCATION
-    # This prevents issues with FindOpenSSL returning NOTFOUND for IMPORTED_LOCATION
-    if(OPENSSL_INCLUDE_DIR)
+if(NOT OpenSSL_FOUND AND WIN32)
+    # Check common Windows OpenSSL locations if not found automatically
+    foreach(_path "C:/Program Files/OpenSSL-Win64" "C:/Program Files (x86)/OpenSSL-Win32" "C:/OpenSSL-Win64" "C:/OpenSSL-Win32")
+        if(EXISTS "${_path}/include/openssl/ssl.h")
+            set(OPENSSL_ROOT_DIR "${_path}")
+            find_package(OpenSSL QUIET)
+            if(OpenSSL_FOUND)
+                break()
+            endif()
+        endif()
+    endforeach()
+endif()
+
+if(OpenSSL_FOUND)
+    target_link_libraries(${CMAKE_PROJECT_NAME} PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+    target_compile_definitions(${CMAKE_PROJECT_NAME} PRIVATE HAVE_OPENSSL=1)
+    message(STATUS "OpenSSL found: ${OPENSSL_VERSION}")
+
+    if(WIN32 AND OPENSSL_INCLUDE_DIR)
         get_filename_component(_ssl_root_dir "${OPENSSL_INCLUDE_DIR}" DIRECTORY)
-        # libcrypto sometimes dynamically depends on zlib1.dll depending on how it was built
         file(GLOB OPENSSL_DLLS "${_ssl_root_dir}/bin/libssl*.dll" "${_ssl_root_dir}/bin/libcrypto*.dll" "${_ssl_root_dir}/bin/zlib*.dll")
         if(OPENSSL_DLLS)
             install(FILES ${OPENSSL_DLLS} DESTINATION "${CMAKE_PROJECT_NAME}/bin/64bit")
         endif()
     endif()
+else()
+    message(STATUS "OpenSSL not found. Building without WSS TLS support.")
 endif()
 
 
@@ -157,7 +171,8 @@ set_target_properties(${CMAKE_PROJECT_NAME} PROPERTIES AUTOMOC ON AUTOUIC ON)
 
 # Set base OBS plugin installation directory depending on OS
 if(WIN32)
-    set(OBS_PLUGIN_INSTALL_DIR "$ENV{APPDATA}/obs-studio/plugins/${CMAKE_PROJECT_NAME}")
+    file(TO_CMAKE_PATH "$ENV{APPDATA}" APPDATA_DIR)
+    set(OBS_PLUGIN_INSTALL_DIR "${APPDATA_DIR}/obs-studio/plugins/${CMAKE_PROJECT_NAME}")
 elseif(APPLE)
     set(OBS_PLUGIN_INSTALL_DIR "$ENV{HOME}/Library/Application Support/obs-studio/plugins/${CMAKE_PROJECT_NAME}")
 else()
@@ -166,25 +181,27 @@ endif()
 
 # Automate plugin copy to OBS on post-build
 if(WIN32)
+    set(OBS_GLOBAL_INSTALL_DIR "C:/Program Files/obs-studio")
     add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-            # Create directories safely across platforms
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
-            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_PLUGIN_INSTALL_DIR}/data/models/"
+            # Create directories
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_GLOBAL_INSTALL_DIR}/obs-plugins/64bit/"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${OBS_GLOBAL_INSTALL_DIR}/data/obs-plugins/${CMAKE_PROJECT_NAME}/models/"
 
-            # Copy compiled binary
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+            # Copy compiled binary and debug symbols
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:${CMAKE_PROJECT_NAME}>" "${OBS_GLOBAL_INSTALL_DIR}/obs-plugins/64bit/"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE_DIR:${CMAKE_PROJECT_NAME}>/$<TARGET_FILE_BASE_NAME:${CMAKE_PROJECT_NAME}>.pdb" "${OBS_GLOBAL_INSTALL_DIR}/obs-plugins/64bit/" || ${CMAKE_COMMAND} -E true
 
             # Copy models directory recursively only if it exists (models are optional in CI)
             COMMAND ${CMAKE_COMMAND}
                     -DSRC="${CMAKE_CURRENT_SOURCE_DIR}/models"
-                    -DDST="${OBS_PLUGIN_INSTALL_DIR}/data/models"
+                    -DDST="${OBS_GLOBAL_INSTALL_DIR}/data/obs-plugins/${CMAKE_PROJECT_NAME}/models"
                     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/copy_if_exists.cmake"
 
-            COMMENT "Install plugin and models into OBS automatically for current system..."
+            COMMENT "Install plugin and models into C:/Program Files/obs-studio automatically (Requires Administrator privileges)..."
     )
     if(OPENSSL_DLLS)
         add_custom_command(TARGET ${CMAKE_PROJECT_NAME} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENSSL_DLLS} "${OBS_PLUGIN_INSTALL_DIR}/bin/64bit/"
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${OPENSSL_DLLS} "${OBS_GLOBAL_INSTALL_DIR}/obs-plugins/64bit/"
             COMMAND_EXPAND_LISTS
         )
     endif()
@@ -207,13 +224,12 @@ else()
     )
 endif()
 
-# Create executable for UI testing
-#add_executable(test_ui test_ui.cpp ui/setup.cpp ui/setup.h ui/setup.ui
-#)
-
-# Link with Qt and enable UI compilation
-#target_link_libraries(test_ui PRIVATE Qt6::Widgets)
-#set_target_properties(test_ui PROPERTIES AUTOMOC ON AUTOUIC ON)
+# Create executable for IDE run configurations (enables Build/Run buttons in CLion)
+if(WIN32 AND CMAKE_BUILD_TYPE STREQUAL "Debug")
+    # This dummy executable allows CLion to automatically create a Run/Build configuration
+    add_executable(clion_dummy src/plugin-main.c)
+    target_link_libraries(clion_dummy PRIVATE ${CMAKE_PROJECT_NAME})
+endif()
 
 # whisper.cpp
 # For single-config generators, default to Release for whisper performance

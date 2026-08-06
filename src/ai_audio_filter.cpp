@@ -325,12 +325,11 @@ static void transcription_worker(ai_filter_data *data)
 				// Detect speech with Silero VAD (or fallback to RMS if VAD model missing)
 				bool is_speech = false;
 				if (data->vad_ctx) {
-					if (rms > SILENCE_RMS_THRESHOLD) {
-						is_speech = whisper_vad_detect_speech_no_reset(
-							data->vad_ctx, pcmf32.data(), pcmf32.size());
-					}
+					// Let Silero VAD decide without an artificial RMS gate, as WASAPI mic levels can be low
+					is_speech = whisper_vad_detect_speech_no_reset(
+						data->vad_ctx, pcmf32.data(), pcmf32.size());
 				} else {
-					is_speech = (rms > SILENCE_RMS_THRESHOLD * 2.0f); // Higher threshold for fallback
+					is_speech = (rms > SILENCE_RMS_THRESHOLD * 0.5f); // Sensitive threshold for RMS fallback
 				}
 
 				size_t frame_ms = (pcmf32.size() * 1000) / 16000;
@@ -780,8 +779,9 @@ static void ai_filter_update(void *data, obs_data_t *settings)
 		};
 		fd->remote_client = new RemoteTranscriber(new_full_url, result_cb, status_cb);
 	} else {
-		blog(LOG_INFO, "[AI Translator] Start local mode (Whisper)");
-		fd->processor = new audio_processor(fd->current_model_path);
+		blog(LOG_INFO, "[AI Translator] Start local mode (Whisper) model: '%s' (GPU: %s)",
+		     fd->current_model_path.c_str(), fd->use_gpu ? "ON" : "OFF");
+		fd->processor = new audio_processor(fd->current_model_path, fd->use_gpu);
 	}
 
 	// ── 4. Restart worker thread ─────────────────────────────────────────────
@@ -876,8 +876,9 @@ static void *ai_filter_create(obs_data_t *settings, obs_source_t *source)
 		};
 		data->remote_client = new RemoteTranscriber(full_url, result_cb, status_cb);
 	} else {
-		blog(LOG_INFO, "[AI Translator] Create with local mode (Whisper)");
-		data->processor = new audio_processor(data->current_model_path);
+		blog(LOG_INFO, "[AI Translator] Create with local mode (Whisper) model: '%s' (GPU: %s)",
+		     data->current_model_path.c_str(), data->use_gpu ? "ON" : "OFF");
+		data->processor = new audio_processor(data->current_model_path, data->use_gpu);
 	}
 
 	// Initialize Silero VAD
