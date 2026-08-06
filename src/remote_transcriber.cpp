@@ -84,7 +84,7 @@ RemoteTranscriber::RemoteTranscriber(const std::string &url, ResultCallback on_r
 	: m_url(url), m_callback(std::move(on_result)), m_status_cb(std::move(on_status)),
 	  m_use_tls(url.size() >= 6 && url.substr(0, 6) == "wss://"),
 	  m_work_guard(asio::make_work_guard(m_io_service)),
-	  m_alive(std::make_shared<bool>(true))
+	  m_alive(std::make_shared<std::atomic<bool>>(true))
 {
 	blog(LOG_INFO, "[RemoteTranscriber] Protocol: %s", m_use_tls ? "wss (TLS)" : "ws (plain)");
 

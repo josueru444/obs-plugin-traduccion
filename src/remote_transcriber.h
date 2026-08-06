@@ -107,7 +107,7 @@ private:
 	std::thread m_io_thread;
 	std::atomic<bool> m_connected{false};
 	std::atomic<bool> m_running{true};
-	std::shared_ptr<bool> m_alive;
+	std::shared_ptr<std::atomic<bool>> m_alive;
 
 	// ── Opus ───────────────────────────────────────────────────────────────────
 	OpusEncoder *m_encoder{nullptr};
