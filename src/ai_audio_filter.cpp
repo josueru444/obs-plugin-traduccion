@@ -1064,9 +1064,10 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 
 			// Downmix all available channels to a single mono frame
 			std::vector<float> mixed_frame(num_samples, 0.0f);
+			uint32_t channels = get_audio_channels(oai.speakers);
 			int active_channels = 0;
 			
-			for (size_t c = 0; c < MAX_AV_PLANES; c++) {
+			for (uint32_t c = 0; c < channels && c < MAX_AV_PLANES; c++) {
 				if (audio->data[c] != nullptr) {
 					float *chan_data = (float *)audio->data[c];
 					for (size_t i = 0; i < num_samples; i++) {
