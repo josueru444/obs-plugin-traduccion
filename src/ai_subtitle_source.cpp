@@ -14,13 +14,9 @@
 // Set text color property
 static void apply_text_color(obs_data_t *settings, long color)
 {
-#if defined(_WIN32)
-	obs_data_set_int(settings, "color", color);
-#else
 	obs_data_set_int(settings, "color1", color);
 	obs_data_set_int(settings, "color2", color);
 	obs_data_set_int(settings, "color", color);
-#endif
 }
 
 struct MyCaptionsFont {
@@ -321,14 +317,13 @@ static void my_font_update(void *data, obs_data_t *settings)
 
 	std::string text_to_set = raw_text;
 
-	if (max_lines > 0 && word_wrap && custom_width > 0) {
-		// Truncate leading words to fit max line count
+	int final_lines = 1;
+
+	if (word_wrap && custom_width > 0) {
 		float avg_char_width = (float)font_size * 0.50f;
 		int chars_per_line = (int)((float)custom_width / avg_char_width);
 		if (chars_per_line < 1) chars_per_line = 20;
 
-		// Split into words, then count chars line-by-line to see how many lines
-		// the full text would occupy. Drop words from the front until it fits.
 		std::vector<std::string> words;
 		{
 			std::string w;
@@ -342,7 +337,6 @@ static void my_font_update(void *data, obs_data_t *settings)
 			if (!w.empty()) words.push_back(w);
 		}
 
-		// Count how many display lines the word list would need
 		auto count_lines = [&](size_t start) -> int {
 			int lines = 1;
 			int line_chars = 0;
@@ -360,13 +354,15 @@ static void my_font_update(void *data, obs_data_t *settings)
 			return lines;
 		};
 
-		// Drop words from the front until the text fits in max_lines
 		size_t first = 0;
-		while (first < words.size() && count_lines(first) > max_lines) {
-			first++;
+		if (max_lines > 0) {
+			while (first < words.size() && count_lines(first) > max_lines) {
+				first++;
+			}
 		}
 
-		// Reassemble
+		final_lines = count_lines(first);
+
 		if (first > 0) {
 			std::string trimmed;
 			for (size_t i = first; i < words.size(); ++i) {
@@ -417,7 +413,11 @@ static void my_font_update(void *data, obs_data_t *settings)
 		obs_data_set_bool(text_settings, "extents", word_wrap);
 		obs_data_set_bool(text_settings, "extents_wrap", word_wrap);
 		obs_data_set_int(text_settings, "extents_cx", custom_width);
-		obs_data_set_int(text_settings, "extents_cy", 0);
+
+		// Compute a reasonable height for the bounding box
+		float estimated_line_height = (float)font_size * 1.4f;
+		int calc_cy = (int)(final_lines * estimated_line_height + 40.0f);
+		obs_data_set_int(text_settings, "extents_cy", calc_cy);
 
 		obs_data_set_bool(text_settings, "word_wrap", word_wrap);
 		obs_data_set_int(text_settings, "custom_width", custom_width);

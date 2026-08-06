@@ -1054,8 +1054,7 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 	bool has_backend =
 		(filter_data->processor != nullptr || filter_data->remote_client != nullptr);
 
-	if (has_backend && audio->data[0]) {
-		float *raw_audio = (float *)audio->data[0];
+	if (has_backend) {
 		size_t num_samples = audio->frames;
 
 		struct obs_audio_info oai;
@@ -1063,17 +1062,36 @@ static struct obs_audio_data *ai_filter_audio(void *data, struct obs_audio_data 
 			// Capture sample rate for the worker thread
 			filter_data->obs_sample_rate = oai.samples_per_sec;
 
-			// Copy raw PCM frame and push to ring buffer
-			std::vector<float> frame(raw_audio, raw_audio + num_samples);
-			{
+			// Downmix all available channels to a single mono frame
+			std::vector<float> mixed_frame(num_samples, 0.0f);
+			int active_channels = 0;
+			
+			for (size_t c = 0; c < MAX_AV_PLANES; c++) {
+				if (audio->data[c] != nullptr) {
+					float *chan_data = (float *)audio->data[c];
+					for (size_t i = 0; i < num_samples; i++) {
+						mixed_frame[i] += chan_data[i];
+					}
+					active_channels++;
+				}
+			}
+
+			if (active_channels > 1) {
+				float inv_channels = 1.0f / (float)active_channels;
+				for (size_t i = 0; i < num_samples; i++) {
+					mixed_frame[i] *= inv_channels;
+				}
+			}
+
+			if (active_channels > 0) {
 				std::lock_guard<std::mutex> lock(filter_data->raw_pcm_mutex);
 				// Bound the ring buffer to avoid unbounded memory growth
 				// if the worker thread falls behind (drop oldest frames)
 				if (filter_data->pcm_raw_queue.size() < 200) {
-					filter_data->pcm_raw_queue.push_back(std::move(frame));
+					filter_data->pcm_raw_queue.push_back(std::move(mixed_frame));
 				}
+				filter_data->raw_cv.notify_one();
 			}
-			filter_data->raw_cv.notify_one();
 		}
 	}
 
