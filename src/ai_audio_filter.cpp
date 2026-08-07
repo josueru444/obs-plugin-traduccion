@@ -2,7 +2,6 @@
 #include "audio_processor.h"
 #include "remote_transcriber.h"
 
-
 #include <media-io/audio-resampler.h>
 #include <obs-module.h>
 #include <util/threading.h>
